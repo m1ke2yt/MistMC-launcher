@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>Mist MC Launcher</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="titlebar">
+    <div class="titlebar-drag">
+      <span class="logo">✦ MIST MC</span>
+      <span class="subtitle">Launcher</span>
+    </div>
+    <div class="titlebar-controls">
+      <button id="btn-min" class="winbtn" title="Свернуть">—</button>
+      <button id="btn-close" class="winbtn winbtn-close" title="Закрыть">✕</button>
+    </div>
+  </div>
+
+  <main>
+    <div class="hero">
+      <div class="hero-title">Mist MC</div>
+      <div class="hero-sub">Minecraft <span id="mc-ver">1.21.11</span> · вход без аккаунта</div>
+    </div>
+
+    <div class="card">
+      <label class="field">
+        <span class="label">Ник в игре</span>
+        <input id="username" type="text" maxlength="16" autocomplete="off" spellcheck="false" placeholder="Например, Steve" />
+        <span class="hint" id="username-hint">3–16 символов: латиница, цифры, _</span>
+      </label>
+
+      <div class="row">
+        <label class="field field-loader">
+          <span class="label">Сборка</span>
+          <div class="segmented" id="loader">
+            <button data-val="fabric" class="seg active">Fabric</button>
+            <button data-val="forge" class="seg">Forge</button>
+            <button data-val="vanilla" class="seg">Vanilla</button>
+          </div>
+          <span class="hint" id="loader-hint">Fabric — рекомендуется, с модами Mist MC</span>
+        </label>
+      </div>
+
+      <label class="field">
+        <span class="label">Оперативная память: <b id="ram-val">4096</b> МБ</span>
+        <input id="ram" type="range" min="2048" max="16384" step="512" value="4096" />
+      </label>
+
+      <label class="checkbox">
+        <input id="joinServer" type="checkbox" checked />
+        <span>Сразу подключиться к <b>mistmc.gg</b></span>
+      </label>
+
+      <details class="advanced">
+        <summary>Дополнительно</summary>
+        <label class="field">
+          <span class="label">Папка игры</span>
+          <div class="row-inline">
+            <input id="gameDir" type="text" readonly />
+            <button id="btn-dir" class="btn-secondary">Обзор…</button>
+          </div>
+        </label>
+      </details>
+    </div>
+
+    <div class="launch-area">
+      <div class="progress-wrap">
+        <div class="status" id="status">Готов к запуску</div>
+        <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+      </div>
+      <button id="btn-play" class="btn-play">ИГРАТЬ</button>
+    </div>
+
+    <div class="logbox" id="logbox" hidden></div>
+
+    <div class="footer">
+      <a href="#" id="link-site">mistmc.gg</a>
+      <span class="dot">·</span>
+      <span id="ver-line">Fabric 0.19.3 / Forge 61.1.0</span>
+      <button id="btn-log" class="link">лог</button>
+    </div>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

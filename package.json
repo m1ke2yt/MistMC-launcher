@@ -1,0 +1,64 @@
+{
+  "name": "mistmc-launcher",
+  "productName": "Mist MC Launcher",
+  "version": "1.0.1",
+  "description": "Minecraft launcher: offline login, Fabric / Forge / Vanilla, bundled JRE",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main.js",
+  "scripts": {
+    "fetch-jre": "node scripts/fetch-jre.mjs",
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "@xmcl/core": "2.15.1",
+    "@xmcl/installer": "6.1.2"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "gg.mistmc.launcher",
+    "productName": "Mist MC Launcher",
+    "artifactName": "MistMC-Launcher-${os}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "zip", "arch": ["x64"] }
+      ],
+      "extraResources": [
+        { "from": "resources/jre-win", "to": "jre", "filter": ["**/*"] },
+        { "from": "resources/mods", "to": "mods", "filter": ["**/*"] }
+      ]
+    },
+    "linux": {
+      "target": [
+        { "target": "tar.gz", "arch": ["x64"] }
+      ],
+      "category": "Game",
+      "extraResources": [
+        { "from": "resources/jre-linux", "to": "jre", "filter": ["**/*"] },
+        { "from": "resources/mods", "to": "mods", "filter": ["**/*"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Mist MC Launcher"
+    },
+    "compression": "maximum"
+  }
+}

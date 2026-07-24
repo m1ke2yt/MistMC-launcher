@@ -1,0 +1,17 @@
+Third-party components
+
+This launcher bundles and/or uses the following components. Their licenses apply
+to the respective parts.
+
+- Electron — MIT License. https://github.com/electron/electron
+- @xmcl/core, @xmcl/installer — MIT License. https://github.com/Voxelum/minecraft-launcher-core-node
+- undici — MIT License. https://github.com/nodejs/undici
+- Eclipse Temurin / OpenJDK (bundled JRE 21) — GNU General Public License v2
+  with the Classpath Exception. Source and builds: https://adoptium.net
+
+Minecraft itself is NOT included. The client, libraries and assets are downloaded
+at runtime from Mojang's servers and are subject to the Minecraft End User License
+Agreement (https://www.minecraft.net/eula).
+
+Any bundled Fabric mods (if placed in resources/mods) remain under their own
+licenses and copyrights.
