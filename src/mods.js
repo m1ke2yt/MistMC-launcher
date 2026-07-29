@@ -695,6 +695,56 @@ function syncMods(gameDir, loader, bundledDir, log) {
   }
 }
 
+// ── инвентаризация клиента для хартбита ─────────────────────────────────
+/**
+ * Что РЕАЛЬНО лежит в папке игры перед запуском — включая закинутое руками
+ * мимо лаунчера. Уходит с хартбитом, показывается в админке сервера.
+ * origin: bundled — вшит в сборку; launcher — поставлен менеджером модов;
+ * manual — jar появился в mods/ мимо нас. id/версия — из fabric.mod.json
+ * внутри jar (переименование файла реальный мод не спрячет).
+ */
+function collectClientInventory(gameDir, bundledDir, loader) {
+  const inv = { loader, mods: [], resourcepacks: { installed: [], enabled: [] }, shaderpacks: [] };
+  try {
+    const m = readManifest(gameDir);
+    const managed = new Set(m.user.filter((e) => e.type === 'mod').map((e) => e.fileName));
+    const bundled = new Set(bundledJars(bundledDir));
+    const dir = contentDir(gameDir, 'mod');
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith('.jar')) continue;
+        const info = fabricModInfo(path.join(dir, f));
+        inv.mods.push({
+          file: f.slice(0, 100),
+          id: info && info.id ? String(info.id).slice(0, 60) : null,
+          version: info && info.version ? String(info.version).slice(0, 40) : null,
+          origin: bundled.has(f) ? 'bundled' : managed.has(f) ? 'launcher' : 'manual',
+        });
+        if (inv.mods.length >= 150) break;
+      }
+    }
+    const rpDir = path.join(gameDir, 'resourcepacks');
+    if (fs.existsSync(rpDir)) {
+      inv.resourcepacks.installed = fs.readdirSync(rpDir).slice(0, 80).map((f) => f.slice(0, 100));
+    }
+    try {
+      const opts = fs.readFileSync(path.join(gameDir, 'options.txt'), 'utf8');
+      const line = opts.split(/\r?\n/).find((l) => l.startsWith('resourcePacks:'));
+      if (line) {
+        const arr = JSON.parse(line.slice('resourcePacks:'.length));
+        if (Array.isArray(arr)) {
+          inv.resourcepacks.enabled = arr.slice(0, 80).map((s) => String(s).slice(0, 100));
+        }
+      }
+    } catch (_) { /* options.txt нет или битый — не мешаем запуску */ }
+    const shDir = path.join(gameDir, 'shaderpacks');
+    if (fs.existsSync(shDir)) {
+      inv.shaderpacks = fs.readdirSync(shDir).slice(0, 40).map((f) => f.slice(0, 100));
+    }
+  } catch (_) { /* инвентаризация не должна ломать запуск */ }
+  return inv;
+}
+
 module.exports = {
   listContent,
   searchContent,
@@ -705,4 +755,5 @@ module.exports = {
   removeUserContent,
   syncMods,
   enforceJarDeps,
+  collectClientInventory,
 };

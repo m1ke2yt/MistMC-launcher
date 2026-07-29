@@ -307,13 +307,15 @@ function logLine(text) { send('log', text); }
 // Хартбит на сайт: «играю за <ник>» при запуске игры. Сайт склеит это с входом
 // на сервер (ловит вход через лаунчер любым способом). Fire-and-forget, 5с таймаут,
 // ошибки молчим — метрика не должна мешать запуску игры.
-function sendLauncherHeartbeat(nick) {
+function sendLauncherHeartbeat(nick, client) {
   if (!nick) return;
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 5000);
     const version = app.getVersion();
     const body = { nick, version };
+    // инвентаризация клиента (моды/паки, включая закинутые руками) — для админки
+    if (client) body.client = client;
     // Подпись запроса ключом официальной сборки: сайт отличает настоящий
     // лаунчер от подделки/ручного запроса. Без ключа (публичная сборка)
     // хартбит уходит неподписанным.
@@ -602,7 +604,9 @@ ipcMain.handle('launch-game', async (_e, opts) => {
 
     // 4) Запуск
     status('Запуск игры…');
-    sendLauncherHeartbeat(account.name); // метка «через лаунчер» для админки
+    // метка «через лаунчер» + инвентаризация модов/паков для админки
+    sendLauncherHeartbeat(account.name,
+      mods.collectClientInventory(gameDir, modsResourceDir(), loader));
     logLine('▶ Запуск версии ' + versionId + ' от имени ' + account.name
       + (account.userType === 'msa' ? ' (Microsoft)' : ' (по нику)'));
     const proc = await launch({
