@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.modrinth.com https://mc-heads.net;" />
   <title>Mist MC Launcher</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -12,25 +12,41 @@
       <span class="logo">✦ MIST MC</span>
       <span class="subtitle">Launcher</span>
     </div>
-    <div class="titlebar-controls">
-      <button id="btn-min" class="winbtn" title="Свернуть">—</button>
-      <button id="btn-close" class="winbtn winbtn-close" title="Закрыть">✕</button>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="game">Игра</button>
+      <button class="tab" data-tab="mods">Моды</button>
+    </nav>
+    <div class="titlebar-right">
+      <!-- Аккаунт в шапке: кнопка входа исчезает после входа, вместо неё чип -->
+      <button id="btn-header-login" class="btn-header-login">Войти</button>
+      <div id="acc-chip" class="acc-chip" hidden>
+        <img id="acc-avatar" class="acc-avatar" alt="" />
+        <span id="acc-avatar-fallback" class="acc-avatar-fallback" hidden></span>
+        <span class="acc-chip-text">
+          <span id="acc-chip-name" class="acc-chip-name"></span>
+          <span id="acc-chip-type" class="acc-chip-type"></span>
+        </span>
+        <span class="acc-caret">▾</span>
+      </div>
+      <div id="acc-menu" class="acc-menu" hidden>
+        <button id="menu-switch" class="acc-menu-item">Сменить аккаунт</button>
+        <button id="menu-logout" class="acc-menu-item acc-menu-danger">Выйти</button>
+      </div>
+      <div class="titlebar-controls">
+        <button id="btn-min" class="winbtn" title="Свернуть">—</button>
+        <button id="btn-close" class="winbtn winbtn-close" title="Закрыть">✕</button>
+      </div>
     </div>
   </div>
 
-  <main>
+  <!-- ══ Вкладка «Игра» ══ -->
+  <main id="view-game">
     <div class="hero">
       <div class="hero-title">Mist MC</div>
-      <div class="hero-sub">Minecraft <span id="mc-ver">1.21.11</span> · вход без аккаунта</div>
+      <div class="hero-sub">Minecraft <span id="mc-ver">1.21.11</span> · вход по нику или лицензии Microsoft</div>
     </div>
 
     <div class="card">
-      <label class="field">
-        <span class="label">Ник в игре</span>
-        <input id="username" type="text" maxlength="16" autocomplete="off" spellcheck="false" placeholder="Например, Steve" />
-        <span class="hint" id="username-hint">3–16 символов: латиница, цифры, _</span>
-      </label>
-
       <div class="row">
         <label class="field field-loader">
           <span class="label">Сборка</span>
@@ -53,6 +69,11 @@
         <span>Сразу подключиться к <b>mistmc.gg</b></span>
       </label>
 
+      <label class="checkbox">
+        <input id="discordRpc" type="checkbox" checked />
+        <span>Показывать в <b>Discord</b>, что я играю на Mist MC</span>
+      </label>
+
       <details class="advanced">
         <summary>Дополнительно</summary>
         <label class="field">
@@ -62,6 +83,7 @@
             <button id="btn-dir" class="btn-secondary">Обзор…</button>
           </div>
         </label>
+        <button id="btn-migrate" class="btn-secondary">📦 Перенести настройки из другого лаунчера</button>
       </details>
     </div>
 
@@ -78,10 +100,131 @@
     <div class="footer">
       <a href="#" id="link-site">mistmc.gg</a>
       <span class="dot">·</span>
+      <button id="btn-migrate-footer" class="link">📦 перенос из другого лаунчера</button>
+      <span class="dot">·</span>
       <span id="ver-line">Fabric 0.19.3 / Forge 61.1.0</span>
+      <button id="btn-update" class="btn-update" hidden>⬆ Обновление готово — перезапустить</button>
       <button id="btn-log" class="link">лог</button>
     </div>
   </main>
+
+  <!-- ══ Вкладка «Моды» ══ -->
+  <main id="view-mods" hidden>
+    <div class="mods-head">
+      <div class="content-types" id="content-types">
+        <button class="ctype active" data-ctype="mod">Моды</button>
+        <button class="ctype" data-ctype="resourcepack">Ресурспаки</button>
+        <button class="ctype" data-ctype="shader">Шейдеры</button>
+      </div>
+      <div class="mods-search">
+        <input id="mod-query" type="text" placeholder="Поиск на Modrinth… (Enter)" />
+        <button id="btn-mod-search" class="btn-secondary">Найти</button>
+      </div>
+      <span class="hint" id="mods-loader-hint"></span>
+    </div>
+
+    <div class="mods-body" id="mods-body">
+      <section class="mods-section" id="sec-installed">
+        <div class="mods-section-title">Установленные</div>
+        <div id="list-installed" class="mods-list"></div>
+      </section>
+
+      <section class="mods-section" id="sec-results" hidden>
+        <div class="mods-section-title" id="results-title">Результаты поиска</div>
+        <div id="list-results" class="mods-list"></div>
+      </section>
+    </div>
+
+    <div class="mods-vanilla" id="mods-vanilla" hidden>
+      <div class="mods-vanilla-icon">🧩</div>
+      <p>Моды работают на <b>Fabric</b> или <b>Forge</b>.</p>
+      <p class="hint">Выбери сборку на вкладке «Игра», и здесь появится каталог модов.</p>
+    </div>
+  </main>
+
+  <!-- ══ Модалка входа ══ -->
+  <div class="overlay" id="login-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-title">Вход в аккаунт</span>
+        <button id="modal-close" class="winbtn">✕</button>
+      </div>
+
+      <div class="modal-block">
+        <span class="label">По нику</span>
+        <div class="row-inline">
+          <input id="nick-input" type="text" maxlength="16" placeholder="Твой игровой ник" spellcheck="false" />
+          <button id="btn-nick-login" class="btn-accent">Войти</button>
+        </div>
+        <span class="hint">3–16 символов: латиница, цифры, подчёркивание.</span>
+        <span class="hint hint-error" id="nick-error" hidden></span>
+      </div>
+
+      <div class="modal-divider"><span>или</span></div>
+
+      <div class="modal-block">
+        <button id="btn-ms-login" class="btn-ms">Войти через Microsoft</button>
+        <span class="hint">Для владельцев лицензии Minecraft.</span>
+        <span class="hint hint-error" id="ms-error" hidden></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Модалка переноса из другого лаунчера ══ -->
+  <div class="overlay" id="migrate-overlay" hidden>
+    <div class="modal modal-wide">
+      <div class="modal-head">
+        <span class="modal-title">📦 Перенос из другого лаунчера</span>
+        <button id="migrate-close" class="winbtn">✕</button>
+      </div>
+      <p class="mig-sub">Заберём твои настройки, миры и паки — играть будет как дома.</p>
+
+      <div class="modal-block">
+        <span class="label">Откуда переносить</span>
+        <div class="row-inline">
+          <select id="migrate-source"></select>
+          <button id="migrate-browse" class="btn-secondary">📁 Обзор…</button>
+        </div>
+        <div class="mig-found" id="migrate-source-hint"></div>
+      </div>
+
+      <div class="modal-block">
+        <span class="label">Что перенести</span>
+        <div class="mig-grid">
+          <label class="mig-card"><input id="mig-options" type="checkbox" checked />
+            <span class="mig-ico">🎛️</span>
+            <span class="mig-name">Настройки игры</span>
+            <span class="mig-desc">управление · графика · звук</span></label>
+          <label class="mig-card"><input id="mig-servers" type="checkbox" checked />
+            <span class="mig-ico">🌐</span>
+            <span class="mig-name">Список серверов</span>
+            <span class="mig-desc">все добавленные адреса</span></label>
+          <label class="mig-card"><input id="mig-resourcepacks" type="checkbox" checked />
+            <span class="mig-ico">🎨</span>
+            <span class="mig-name">Ресурспаки</span>
+            <span class="mig-desc">текстуры и паки</span></label>
+          <label class="mig-card"><input id="mig-shaderpacks" type="checkbox" checked />
+            <span class="mig-ico">✨</span>
+            <span class="mig-name">Шейдеры</span>
+            <span class="mig-desc">графика Iris/OptiFine</span></label>
+          <label class="mig-card"><input id="mig-saves" type="checkbox" checked />
+            <span class="mig-ico">🗺️</span>
+            <span class="mig-name">Одиночные миры</span>
+            <span class="mig-desc">твои сохранения</span></label>
+          <label class="mig-card"><input id="mig-configs" type="checkbox" checked />
+            <span class="mig-ico">📍</span>
+            <span class="mig-name">Данные модов</span>
+            <span class="mig-desc">вейпоинты · схематики · эмоции</span></label>
+        </div>
+        <span class="hint">Моды не переносятся — ставь во вкладке «Моды»: там всё проверено и под нашу версию.</span>
+      </div>
+
+      <div class="modal-block">
+        <button id="migrate-run" class="btn-accent">Перенести выбранное</button>
+        <div class="migrate-results" id="migrate-results" hidden></div>
+      </div>
+    </div>
+  </div>
 
   <script src="renderer.js"></script>
 </body>

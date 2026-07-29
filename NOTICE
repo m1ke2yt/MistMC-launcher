@@ -5,13 +5,7 @@ to the respective parts.
 
 - Electron — MIT License. https://github.com/electron/electron
 - @xmcl/core, @xmcl/installer — MIT License. https://github.com/Voxelum/minecraft-launcher-core-node
+- electron-updater — MIT License. https://github.com/electron-userland/electron-builder
+- @xhayper/discord-rpc — MIT License. https://github.com/xhayper/discord-rpc
 - undici — MIT License. https://github.com/nodejs/undici
-- Eclipse Temurin / OpenJDK (bundled JRE 21) — GNU General Public License v2
-  with the Classpath Exception. Source and builds: https://adoptium.net
-
-Minecraft itself is NOT included. The client, libraries and assets are downloaded
-at runtime from Mojang's servers and are subject to the Minecraft End User License
-Agreement (https://www.minecraft.net/eula).
-
-Any bundled Fabric mods (if placed in resources/mods) remain under their own
-licenses and copyrights.
+- Eclipse Temurin JRE — GPLv2 with Classpath Exception. https://adoptium.net

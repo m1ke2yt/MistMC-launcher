@@ -1,5 +1,5 @@
-// Downloads a Temurin JRE 21 into resources/jre-<platform>.
-// Usage: node scripts/fetch-jre.mjs win | node scripts/fetch-jre.mjs linux
+// Скачивает Temurin JRE 21 и раскладывает в resources/jre-<platform>
+// Запуск: node scripts/fetch-jre.mjs win   |   node scripts/fetch-jre.mjs linux
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -17,7 +17,7 @@ const API = `https://api.adoptium.net/v3/binary/latest/21/ga/${PLAT}/x64/jre/hot
 
 async function main() {
   if (fs.existsSync(path.join(jreDir, probe))) {
-    console.log('JRE already present:', jreDir);
+    console.log('JRE уже на месте:', jreDir);
     return;
   }
   fs.rmSync(jreDir, { recursive: true, force: true });
@@ -25,9 +25,12 @@ async function main() {
 
   const ext = PLAT === 'windows' ? 'zip' : 'tar.gz';
   const tmpArc = path.join(os.tmpdir(), `temurin-jre-21-${PLAT}.${ext}`);
+  console.log(`Скачиваю Temurin JRE 21 (${PLAT})…`);
   const res = await fetch(API, { redirect: 'follow' });
-  if (!res.ok) throw new Error('download failed: HTTP ' + res.status);
-  fs.writeFileSync(tmpArc, Buffer.from(await res.arrayBuffer()));
+  if (!res.ok) throw new Error('Не удалось скачать JRE: HTTP ' + res.status);
+  const buf = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(tmpArc, buf);
+  console.log('Скачано', (buf.length / 1e6).toFixed(1), 'МБ. Распаковываю…');
 
   const tmpOut = path.join(os.tmpdir(), `temurin-jre-21-${PLAT}-out`);
   fs.rmSync(tmpOut, { recursive: true, force: true });
@@ -36,6 +39,7 @@ async function main() {
     execFileSync('powershell', ['-NoProfile', '-Command',
       `Expand-Archive -LiteralPath '${tmpArc}' -DestinationPath '${tmpOut}' -Force`], { stdio: 'inherit' });
   } else {
+    // tar доступен и на Windows (git/MSYS) и на Linux
     execFileSync('tar', ['-xzf', tmpArc, '-C', tmpOut], { stdio: 'inherit' });
   }
 
@@ -47,8 +51,10 @@ async function main() {
   fs.rmSync(tmpArc, { force: true });
   fs.rmSync(tmpOut, { recursive: true, force: true });
 
-  if (!fs.existsSync(path.join(jreDir, probe))) throw new Error('missing ' + probe + ' after extract');
-  console.log('JRE ready:', jreDir);
+  if (!fs.existsSync(path.join(jreDir, probe))) {
+    throw new Error('После распаковки не найден ' + probe);
+  }
+  console.log('JRE готов:', jreDir);
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
