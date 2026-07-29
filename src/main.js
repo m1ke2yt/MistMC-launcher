@@ -589,6 +589,11 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     // 3) Синхронизация модов под выбранный загрузчик (вшитые + установленные из лаунчера)
     status('Синхронизация модов…');
     mods.syncMods(gameDir, loader, modsResourceDir(), logLine);
+    // жёсткие версии-зависимости из fabric.mod.json (напр. Replay Voice Chat
+    // требует Replay Mod ровно 2.6.25) — чиним ДО запуска; сбой сети не мешает
+    try {
+      await mods.enforceJarDeps(gameDir, loader, MC_VERSION, logLine);
+    } catch (_) { /* без сети играем как есть */ }
 
     // 3.5) Серверный ресурспак (петы) с автообновлением по sha1 — запасной
     // канал к раздаче пака сервером; сбои сети запуску не мешают

@@ -436,6 +436,11 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
       }
     }
   }
+  // жёсткие требования из fabric.mod.json (Modrinth-deps их не знают):
+  // только на верхнем уровне — enforceJarDeps сам ставит версии с depth 4
+  if (depth === 0 && type === 'mod') {
+    try { await enforceJarDeps(gameDir, loader, mcVersion, log); } catch (_) { /* сеть */ }
+  }
   return { ok: true };
 }
 
@@ -511,6 +516,127 @@ function removeUserContent(gameDir, type, fileName) {
   return { ok: true, pending: true };
 }
 
+// ── жёсткие зависимости из fabric.mod.json ──────────────────────────────
+// Modrinth-метаданные знают не всё: у Replay Voice Chat требование
+// «replaymod = 2.6.25» записано ТОЛЬКО в fabric.mod.json внутри jar (в deps
+// на Modrinth его нет вовсе) — юзер ставил Replay Mod отдельно, получал
+// свежайший 2.6.27, и Fabric падал «Incompatible mods found». Поэтому после
+// каждой установки и перед запуском читаем fabric.mod.json активных модов и
+// приводим установленные версии под ТОЧНЫЕ требования (диапазоны >=/~/^ не
+// трогаем — их удовлетворяет свежая версия).
+
+/** Достаёт один файл из zip/jar без внешних библиотек (центральная
+ * директория → локальный заголовок → inflateRaw). null — файла нет/битый. */
+function readZipEntry(file, wantName) {
+  const buf = fs.readFileSync(file);
+  // EOCD (PK\x05\x06) ищем с конца (комментарий до 64 КБ)
+  let eocd = -1;
+  const from = Math.max(0, buf.length - 65557);
+  for (let i = buf.length - 22; i >= from; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16); // смещение центральной директории
+  for (let n = 0; n < count && p + 46 <= buf.length; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) return null;
+    const method = buf.readUInt16LE(p + 10);
+    const csize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
+    if (name === wantName) {
+      if (buf.readUInt32LE(lho) !== 0x04034b50) return null;
+      const lNameLen = buf.readUInt16LE(lho + 26);
+      const lExtraLen = buf.readUInt16LE(lho + 28);
+      const start = lho + 30 + lNameLen + lExtraLen;
+      const data = buf.subarray(start, start + csize);
+      try {
+        return method === 8 ? require('zlib').inflateRawSync(data)
+          : method === 0 ? Buffer.from(data) : null;
+      } catch (_) { return null; }
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
+}
+
+/** fabric.mod.json джарника: { id, version, depends } (null — не фабрик-мод). */
+function fabricModInfo(file) {
+  try {
+    const raw = readZipEntry(file, 'fabric.mod.json');
+    if (!raw) return null;
+    const j = JSON.parse(raw.toString('utf8').replace(/^﻿/, ''));
+    return { id: j.id, version: String(j.version || ''), depends: j.depends || {} };
+  } catch (_) { return null; }
+}
+
+/** Точное требование версии («1.21.11-2.6.25», «=1.2.3») → строка; иначе null. */
+function exactConstraint(c) {
+  const list = Array.isArray(c) ? c : [c];
+  for (const one of list) {
+    if (typeof one !== 'string') continue;
+    const v = one.replace(/^==?/, '').trim();
+    if (v && v !== '*' && !/[><~^* ]/.test(v)) return v;
+  }
+  return null;
+}
+
+/**
+ * Сверка жёстких зависимостей установленных модов: если мод требует ТОЧНУЮ
+ * версию другого УСТАНОВЛЕННОГО мода, а стоит другая — переустанавливаем
+ * требуемую (ищем на Modrinth по version_number). Сеть упала — молча выходим.
+ */
+async function enforceJarDeps(gameDir, loader, mcVersion, log) {
+  if (loader !== 'fabric') return;
+  const m = readManifest(gameDir);
+  const active = m.user.filter((e) => e.type === 'mod' && e.loader === loader
+    && e.enabled && !e.pendingRemove);
+  // modid → манифест-запись + фактическая версия из jar
+  const byModId = new Map();
+  const infos = [];
+  for (const e of active) {
+    const p = filePathOf(gameDir, e);
+    if (!fs.existsSync(p)) continue;
+    const info = fabricModInfo(p);
+    if (!info || !info.id) continue;
+    byModId.set(info.id, { entry: e, version: info.version });
+    infos.push({ entry: e, info });
+  }
+  for (const { entry, info } of infos) {
+    for (const [depId, constraint] of Object.entries(info.depends)) {
+      const want = exactConstraint(constraint);
+      if (!want) continue;
+      const have = byModId.get(depId);
+      if (!have || have.version === want) continue; // не наш мод или уже та версия
+      log('⚑ ' + entry.title + ' требует ' + have.entry.title + ' ' + want
+        + ', стоит ' + have.version + ' — меняю версию');
+      try {
+        const versions = await apiGet(API + '/project/'
+          + encodeURIComponent(have.entry.projectId) + '/version?loaders='
+          + encodeURIComponent(JSON.stringify([loader])));
+        const target = (versions || []).find((v) => v.version_number === want)
+          || (versions || []).find((v) => v.version_number.endsWith('-' + want)
+            || v.version_number.endsWith(want));
+        if (!target) {
+          log('  ! версия ' + want + ' не нашлась на Modrinth — пропускаю');
+          continue;
+        }
+        await installContent(gameDir, {
+          projectId: have.entry.projectId,
+          slug: have.entry.slug,
+          title: have.entry.title,
+          iconUrl: have.entry.iconUrl || '',
+        }, 'mod', loader, mcVersion, log, 4, target.id);
+      } catch (e2) {
+        log('  ! не удалось привести версию: ' + e2.message);
+      }
+    }
+  }
+}
+
 // ── синхронизация модов перед запуском ─────────────────────────────────
 // В mods/ активны только моды ТЕКУЩЕГО загрузчика (чужие уходят в .disabled —
 // иначе Forge спотыкается о fabric-джарники и наоборот); вшитая сборка Mist MC
@@ -578,4 +704,5 @@ module.exports = {
   toggleBundledMod,
   removeUserContent,
   syncMods,
+  enforceJarDeps,
 };
