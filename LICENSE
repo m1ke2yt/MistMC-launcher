@@ -1,16 +1,27 @@
-MIT License
+Mist MC Launcher — Source-Available License
 
-Copyright (c) 2026 Mist MC
+Copyright (c) 2026 Mist MC (mistmc.gg)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Исходный код опубликован для прозрачности: любой может читать и проверять,
+что именно делает официальный лаунчер Mist MC.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Разрешается:
+1. Просматривать, изучать и проверять исходный код.
+2. Собирать код локально для личной проверки его соответствия
+   официальным сборкам.
+3. Сообщать об уязвимостях и предлагать исправления (pull request).
+
+Запрещается без письменного разрешения Mist MC:
+1. Распространять этот код или сборки из него, в изменённом или
+   неизменённом виде.
+2. Выдавать любые сборки за официальный лаунчер Mist MC, использовать
+   название «Mist MC», логотипы и доменные имена проекта.
+3. Использовать идентификаторы официальной сборки (Azure client_id,
+   ключи подписи запросов и т.п.) в сторонних сборках.
+4. Использовать код или его части в других проектах.
+
+Официальные сборки распространяются только через https://mistmc.gg/downloads.
+Контрольные суммы: SHA256SUMS.txt рядом с файлами загрузки.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

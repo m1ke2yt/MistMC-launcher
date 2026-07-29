@@ -13,6 +13,7 @@ const mods = require('./mods');
 const rpc = require('./discordrpc');
 const respack = require('./respack');
 const migrate = require('./migrate');
+const buildSecret = require('./build-secret');
 
 // На Linux при распаковке из архива chrome-sandbox не получает setuid-root →
 // стандартный sandbox падает. Отключаем его (безопасно для лаунчера в домашней папке).
@@ -27,7 +28,10 @@ const SERVER_HOST = 'mistmc.gg';  // Java SRV → connect.mistmc.gg:25584
 // отличает вход через лаунчер от ручного входа по mistmc.gg (метрика в админке)
 const JOIN_HOST = 'connect.mistmc.gg:25584';
 const SITE_URL = 'https://mistmc.gg';
-const MS_CLIENT_ID = 'fc39a138-e8b8-4d93-9fb9-c86f7c3d8e56'; // Azure App (MistMC Launcher)
+// Azure App client_id официальной сборки в публичный репозиторий не входит:
+// для своей сборки зарегистрируйте собственное приложение в Azure (Entra ID)
+// и подставьте его id. Сборки с чужим client_id нарушают лицензию.
+const MS_CLIENT_ID = 'YOUR_AZURE_APP_CLIENT_ID';
 const DISCORD_RPC_APP_ID = '1531346124374409299'; // приложение «MistMC» (отдельное, только для Rich Presence)
 
 const VERSION_INFO = { mc: MC_VERSION, fabric: FABRIC_LOADER, forge: FORGE_VERSION, server: SERVER_HOST };
@@ -308,10 +312,22 @@ function sendLauncherHeartbeat(nick) {
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 5000);
+    const version = app.getVersion();
+    const body = { nick, version };
+    // Подпись запроса ключом официальной сборки: сайт отличает настоящий
+    // лаунчер от подделки/ручного запроса. Без ключа (публичная сборка)
+    // хартбит уходит неподписанным.
+    if (buildSecret.HEARTBEAT_HMAC_KEY) {
+      body.ts = Date.now();
+      body.sig = crypto
+        .createHmac('sha256', buildSecret.HEARTBEAT_HMAC_KEY)
+        .update(nick + '|' + version + '|' + body.ts)
+        .digest('hex');
+    }
     fetch(SITE_URL + '/api/bridge/launcher/heartbeat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nick, version: app.getVersion() }),
+      body: JSON.stringify(body),
       signal: ac.signal,
     }).catch(() => {}).finally(() => clearTimeout(timer));
   } catch (_) { /* ignore */ }
