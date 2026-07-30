@@ -13,6 +13,8 @@ const mods = require('./mods');
 const rpc = require('./discordrpc');
 const respack = require('./respack');
 const migrate = require('./migrate');
+const translate = require('./translate');
+const community = require('./community');
 const buildSecret = require('./build-secret');
 
 // На Linux при распаковке из архива chrome-sandbox не получает setuid-root →
@@ -27,11 +29,9 @@ const SERVER_HOST = 'mistmc.gg';  // Java SRV → connect.mistmc.gg:25584
 // Автоподключение идёт по фактическому эндпоинту: по хосту в хендшейке сервер
 // отличает вход через лаунчер от ручного входа по mistmc.gg (метрика в админке)
 const JOIN_HOST = 'connect.mistmc.gg:25584';
-const SITE_URL = 'https://mistmc.gg';
-// Azure App client_id официальной сборки в публичный репозиторий не входит:
-// для своей сборки зарегистрируйте собственное приложение в Azure (Entra ID)
-// и подставьте его id. Сборки с чужим client_id нарушают лицензию.
-const MS_CLIENT_ID = 'YOUR_AZURE_APP_CLIENT_ID';
+// MISTMC_SITE_URL — для локальной отладки против dev-сервера сайта
+const SITE_URL = process.env.MISTMC_SITE_URL || 'https://mistmc.gg';
+const MS_CLIENT_ID = 'YOUR_AZURE_APP_CLIENT_ID'; // Azure App (MistMC Launcher)
 const DISCORD_RPC_APP_ID = '1531346124374409299'; // приложение «MistMC» (отдельное, только для Rich Presence)
 
 const VERSION_INFO = { mc: MC_VERSION, fabric: FABRIC_LOADER, forge: FORGE_VERSION, server: SERVER_HOST };
@@ -253,8 +253,12 @@ function createWindow() {
 }
 
 // ─── Автообновление ───────────────────────────────────────────────────
-// electron-updater по generic-каналу: сверяет версию с https://mistmc.gg/downloads/latest.yml,
-// тихо качает установщик в фоне и ставит при выходе (или по кнопке «Перезапустить»).
+// electron-updater по generic-каналу: сверяет версию с https://mistmc.gg/downloads/latest.yml
+// и тихо качает новую версию в фоне. Установка «мягкая»: quitAndInstall(true, true) —
+// NSIS запускается в silent-режиме (/S), без окон мастера, и сам перезапускает
+// лаунчер. Renderer получает состояния update-state: available → downloading →
+// ready (кнопка «Обновить» с прогрессом). Нажатие до конца загрузки просто
+// ставит флаг «установить, как докачается».
 // В dev-запуске и без app-update.yml (старые распаковки) молча выключено.
 function setupAutoUpdate() {
   if (!app.isPackaged || process.platform !== 'win32') return;
@@ -266,19 +270,34 @@ function setupAutoUpdate() {
     return;
   }
   autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true; // тихо доставится при закрытии
+  autoUpdater.autoInstallOnAppQuit = true; // не нажал кнопку — тихо доставится при закрытии
+  let downloaded = false;
+  let installWhenReady = false; // «Обновить» нажали, пока файл ещё качался
   autoUpdater.on('update-available', (info) => {
     logLine('⬆ Доступно обновление ' + info.version + ' — скачиваю в фоне…');
+    send('update-state', { state: 'available', version: info.version });
+  });
+  autoUpdater.on('download-progress', (p) => {
+    send('update-state', { state: 'downloading', percent: Math.round(p.percent || 0) });
   });
   autoUpdater.on('update-downloaded', (info) => {
-    logLine('⬆ Обновление ' + info.version + ' готово — установится при закрытии лаунчера.');
-    send('update-ready', { version: info.version });
+    downloaded = true;
+    logLine('⬆ Обновление ' + info.version + ' скачано — жмите «Обновить» (поставится тихо, без установщика).');
+    send('update-state', { state: 'ready', version: info.version });
+    if (installWhenReady) autoUpdater.quitAndInstall(true, true);
   });
   autoUpdater.on('error', (err) => {
     // обновление — не повод мешать играть: только строка в лог
     logLine('⬆ автообновление: ' + (err && err.message ? err.message.split('\n')[0] : err));
+    send('update-state', { state: 'error' });
   });
-  ipcMain.on('update-restart', () => autoUpdater.quitAndInstall());
+  ipcMain.on('update-restart', () => {
+    if (downloaded) {
+      autoUpdater.quitAndInstall(true, true); // silent NSIS + автоперезапуск
+    } else {
+      installWhenReady = true;
+    }
+  });
   autoUpdater.checkForUpdates().catch(() => {});
   // и раз в 4 часа, если лаунчер живёт долго
   setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 3600e3);
@@ -287,6 +306,8 @@ function setupAutoUpdate() {
 app.whenReady().then(() => {
   createWindow();
   setupAutoUpdate();
+  translate.init(app.getPath('userData'));
+  community.init(SITE_URL);
   const cfg = loadConfig();
   if (cfg.discordRpc !== false) {
     rpc.init(DISCORD_RPC_APP_ID, logLine);
@@ -392,6 +413,14 @@ ipcMain.handle('pick-dir', async () => {
   return res.filePaths[0];
 });
 
+// Открыть папку игры в проводнике (создаём, если до первого запуска её ещё нет)
+ipcMain.handle('open-game-dir', async () => {
+  const dir = currentGameDir();
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* покажет openPath */ }
+  const err = await shell.openPath(dir);
+  return { ok: !err, error: err || undefined };
+});
+
 // ── Перенос настроек из другого лаунчера ──
 ipcMain.handle('migrate-scan', () => {
   try {
@@ -476,15 +505,50 @@ ipcMain.handle('mods-list', (_e, { type, loader }) => {
     return { ok: false, error: e.message, bundled: [], user: [] };
   }
 });
+// Перевод — с жёстким потолком по времени: не успел — показываем оригинал,
+// а результат всё равно докэшируется и всплывёт при следующем запросе.
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise.catch(() => fallback),
+    new Promise((r) => setTimeout(() => r(fallback), ms)),
+  ]);
+}
+
 ipcMain.handle('mods-search', async (_e, { query, type, loader }) => {
   try {
-    return { ok: true, hits: await mods.searchContent(query, type, loader, MC_VERSION) };
+    const hits = await mods.searchContent(query, type, loader, MC_VERSION);
+    // описания результатов — на русский (одним пакетным запросом)
+    const tr = await withTimeout(
+      translate.batch(hits.map((h) => h.description), hits.map((h) => h.title)), 4000, null);
+    if (tr) hits.forEach((h, i) => { h.description = tr[i]; });
+    return { ok: true, hits };
   } catch (e) {
     return {
       ok: false,
       error: 'Поиск Modrinth сейчас недоступен (' + e.message + ') — попробуй ещё раз через минуту. Подборка ниже работает.',
       hits: [],
     };
+  }
+});
+ipcMain.handle('mod-details', async (_e, { idOrSlug }) => {
+  try {
+    const project = await mods.projectDetails(idOrSlug);
+    // полное описание и краткую строку — на русский; null = перевода нет,
+    // модалка покажет оригинал (и переключатель не появится)
+    const [bodyRu, descriptionRu] = await withTimeout(Promise.all([
+      translate.markdown(project.body, [project.title]),
+      translate.plain(project.description, [project.title]),
+    ]), 12000, [null, null]);
+    return {
+      ok: true,
+      project: {
+        ...project,
+        bodyRu: bodyRu && bodyRu !== project.body ? bodyRu : null,
+        descriptionRu: descriptionRu && descriptionRu !== project.description ? descriptionRu : null,
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: 'Не удалось загрузить страницу мода: ' + e.message };
   }
 });
 ipcMain.handle('mods-popular', async (_e, { type, loader }) => {
@@ -507,6 +571,47 @@ ipcMain.handle('mod-toggle', (_e, { type, fileName, enabled, bundled }) => {
     : mods.toggleUserContent(currentGameDir(), type, fileName, enabled);
 });
 ipcMain.handle('mod-remove', (_e, { type, fileName }) => mods.removeUserContent(currentGameDir(), type, fileName));
+
+// ─── Сообщество: оценки модов и коды сборок ──────────────────────────
+function currentNick() {
+  const acc = resolveAccount(loadConfig());
+  return acc ? acc.name : null;
+}
+
+ipcMain.handle('community-vote', async (_e, { project, value }) => {
+  const nick = currentNick();
+  if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
+  if (!project || !project.projectId) return { ok: false, error: 'Нет мода' };
+  return community.vote(nick, project, value);
+});
+ipcMain.handle('community-ratings', (_e, { ids }) => community.ratings(ids, currentNick()));
+ipcMain.handle('community-top', (_e, { type }) => community.top(type, 25));
+
+ipcMain.handle('build-share', async (_e, { loader }) => {
+  const nick = currentNick();
+  if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
+  const build = mods.exportBuild(currentGameDir(), loader || 'fabric');
+  if (!build.items.length) {
+    return { ok: false, error: 'Сборка пустая — поставь хотя бы один мод' };
+  }
+  return community.shareBuild(nick, build);
+});
+
+ipcMain.handle('build-apply', async (_e, { code }) => {
+  const res = await community.fetchBuild(code);
+  if (!res.ok) return res;
+  try {
+    status('Применяю сборку…');
+    send('state', { state: 'working' });
+    const summary = await mods.applyBuild(currentGameDir(), res.build, MC_VERSION, logLine);
+    send('state', { state: 'idle' });
+    status('Сборка применена');
+    return { ok: true, author: res.author, summary };
+  } catch (e) {
+    send('state', { state: 'idle' });
+    return { ok: false, error: e.message };
+  }
+});
 
 let launching = false;
 

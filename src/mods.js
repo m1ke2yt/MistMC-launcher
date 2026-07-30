@@ -297,6 +297,33 @@ async function popularContent(type, loader, mcVersion) {
   return out;
 }
 
+// ── страница проекта (модалка в лаунчере) ───────────────────────────────
+// Полная карточка с Modrinth: описание (markdown body) + галерея скриншотов.
+// Кэшируем на сессию — повторное открытие модалки мгновенное.
+const detailsCache = new Map(); // idOrSlug -> project
+async function projectDetails(idOrSlug) {
+  if (detailsCache.has(idOrSlug)) return detailsCache.get(idOrSlug);
+  const p = await apiGet(API + '/project/' + encodeURIComponent(idOrSlug));
+  const gallery = (Array.isArray(p.gallery) ? p.gallery : [])
+    .filter((g) => g && typeof g.url === 'string' && /^https:\/\//i.test(g.url))
+    .sort((a, b) => (b.featured ? 1 : 0) - (a.featured ? 1 : 0) || (a.ordering || 0) - (b.ordering || 0))
+    .slice(0, 12)
+    .map((g) => ({ url: g.url, title: g.title || '' }));
+  const out = {
+    projectId: p.id,
+    slug: p.slug,
+    title: p.title || p.slug,
+    description: CURATED_RU.get(p.slug) || p.description || '',
+    body: p.body || '',
+    iconUrl: p.icon_url || '',
+    downloads: p.downloads || 0,
+    followers: p.followers || 0,
+    gallery,
+  };
+  detailsCache.set(idOrSlug, out);
+  return out;
+}
+
 // ── установка (с обязательными зависимостями) ───────────────────────────
 function versionLoaders(type, loader) {
   if (type === 'resourcepack') return ['minecraft'];
@@ -320,7 +347,10 @@ async function pickVersion(projectId, type, loader, mcVersion, pinnedVersionId) 
     versions = await apiGet(base);
   }
   if (!Array.isArray(versions) || !versions.length) return null;
-  return versions[0]; // API отдаёт от новых к старым
+  // API отдаёт от новых к старым. Берём свежую СТАБИЛЬНУЮ: иначе игрокам
+  // прилетали беты (Sodium 0.8.14-beta.1 вместо 0.8.13). Если релиза под
+  // эту версию MC нет вовсе — ставим что есть.
+  return versions.find((v) => v.version_type === 'release') || versions[0];
 }
 
 /** Пин на этот проект от уже установленных модов (совместимость по manifest.depPins). */
@@ -352,9 +382,16 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
   const t = typeInfo(type);
   const m = readManifest(gameDir);
 
-  // пин от уже установленных модов (напр. Iris требует конкретный Sodium)
+  const existing = m.user.find((e) => e.projectId === project.projectId && e.type === type
+      && (!t.perLoader || e.loader === loader));
+
+  // pinnedVersionId приходит от enforceJarDeps — это АВТОРИТЕТ (посчитан по
+  // fabric.mod.json всех установленных модов), выполняем даже заменой стоящей
+  // версии. Пин Modrinth («с чем тестировали») — МЯГКИЙ: только при первой
+  // установке. Раньше он применялся всегда и утаскивал уже стоящий мод назад:
+  // Iris пинил Sodium 0.8.7 поверх 0.8.13, и Sodium Extra (>=0.8.13) падал.
   let pin = pinnedVersionId;
-  if (!pin && type === 'mod') {
+  if (!pin && !existing && type === 'mod') {
     const found = pinFromInstalled(m, project.projectId, loader);
     if (found) {
       pin = found.versionId;
@@ -362,9 +399,7 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
     }
   }
 
-  const existing = m.user.find((e) => e.projectId === project.projectId && e.type === type
-      && (!t.perLoader || e.loader === loader));
-  if (existing && (!pin || existing.versionId === pin)) {
+  if (existing && (!pinnedVersionId || existing.versionId === pinnedVersionId)) {
     return { ok: true, already: true };
   }
 
@@ -420,8 +455,9 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
       if (loader === 'fabric' && BUNDLED_PROJECTS.has(dep.project_id)) continue;
       const cur = readManifest(gameDir);
       const have = cur.user.find((e) => e.projectId === dep.project_id && e.type === 'mod' && e.loader === loader);
-      // уже стоит нужная (или непринципиальная) версия — не трогаем
-      if (have && (!dep.version_id || have.versionId === dep.version_id)) continue;
+      // зависимость уже стоит — версию не навязываем: пин Modrinth мягкий,
+      // а реальные требования разрулит enforceJarDeps по fabric.mod.json
+      if (have) continue;
       try {
         const info = await apiGet(API + '/project/' + dep.project_id);
         log('  + зависимость: ' + info.title + (dep.version_id ? ' (закреплённая версия)' : ''));
@@ -573,21 +609,117 @@ function fabricModInfo(file) {
   } catch (_) { return null; }
 }
 
-/** Точное требование версии («1.21.11-2.6.25», «=1.2.3») → строка; иначе null. */
-function exactConstraint(c) {
-  const list = Array.isArray(c) ? c : [c];
-  for (const one of list) {
-    if (typeof one !== 'string') continue;
-    const v = one.replace(/^==?/, '').trim();
-    if (v && v !== '*' && !/[><~^* ]/.test(v)) return v;
+// ── версии и предикаты fabric.mod.json ─────────────────────────────────
+// Нужны, чтобы понимать требования вида ">=0.8.13", "0.8.x", "~1.2.3".
+// РАНЬШЕ диапазоны игнорировались («свежая версия и так подойдёт»), но версию
+// зависимости мог удерживать пин Modrinth от другого мода — и игра падала
+// «requires version 0.8.13 or later, but only 0.8.7 is present».
+
+/** «0.8.7+mc1.21.11» → { nums:[0,8,7], pre:null }; null — не разобрали. */
+function parseVer(v) {
+  const s = String(v || '').trim().split('+')[0];
+  const m = s.match(/^(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?$/);
+  if (!m) return null;
+  return { nums: [+m[1], +m[2], m[3] === undefined ? 0 : +m[3]], pre: m[4] || null };
+}
+
+/** Сравнение по semver: пререлиз меньше релиза (0.8.14-beta.1 < 0.8.14). */
+function cmpVer(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a.nums[i] !== b.nums[i]) return a.nums[i] < b.nums[i] ? -1 : 1;
   }
-  return null;
+  if (a.pre === b.pre) return 0;
+  if (!a.pre) return 1;
+  if (!b.pre) return -1;
+  const ap = a.pre.split('.');
+  const bp = b.pre.split('.');
+  for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
+    const x = ap[i];
+    const y = bp[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    const nx = /^\d+$/.test(x);
+    const ny = /^\d+$/.test(y);
+    if (nx && ny) { if (+x !== +y) return +x < +y ? -1 : 1; } else if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Один предикат: «*», «1.2.3», «>=1.2.3», «~1.2.3», «^1.2.3», «1.2.x». */
+function satisfiesOne(version, predicate) {
+  const ver = parseVer(version);
+  if (!ver) return true; // версию не разобрали — не мешаем игроку
+  let p = String(predicate || '').trim();
+  if (!p || p === '*') return true;
+  const op = (p.match(/^(>=|<=|>|<|=|~|\^)/) || [])[1] || '';
+  p = p.slice(op.length).trim().split('+')[0];
+  // wildcard: 1.2.x / 1.x → диапазон [низ, следующий разряд)
+  if (/[xX*]/.test(p)) {
+    const parts = p.split('.');
+    const idx = parts.findIndex((s) => /^[xX*]$/.test(s));
+    if (idx <= 0) return true; // «x» вместо мажора — что угодно
+    const lowNums = [0, 0, 0];
+    for (let i = 0; i < idx; i++) lowNums[i] = +parts[i] || 0;
+    const low = { nums: lowNums, pre: null };
+    const highNums = lowNums.slice();
+    highNums[idx - 1] += 1;
+    for (let i = idx; i < 3; i++) highNums[i] = 0;
+    return cmpVer(ver, low) >= 0 && cmpVer(ver, { nums: highNums, pre: null }) < 0;
+  }
+  const target = parseVer(p);
+  if (!target) return true;
+  const c = cmpVer(ver, target);
+  switch (op) {
+    case '>=': return c >= 0;
+    case '>': return c > 0;
+    case '<=': return c <= 0;
+    case '<': return c < 0;
+    case '~': { // >=x.y.z <x.(y+1).0
+      const hi = { nums: [target.nums[0], target.nums[1] + 1, 0], pre: null };
+      return c >= 0 && cmpVer(ver, hi) < 0;
+    }
+    case '^': { // semver: для 0.y фиксируется и minor
+      const hi = target.nums[0] === 0
+        ? { nums: [0, target.nums[1] + 1, 0], pre: null }
+        : { nums: [target.nums[0] + 1, 0, 0], pre: null };
+      return c >= 0 && cmpVer(ver, hi) < 0;
+    }
+    default: return c === 0;
+  }
+}
+
+/** Требование целиком: массив = ИЛИ, пробелы внутри строки = И. */
+function satisfies(version, constraint) {
+  const list = Array.isArray(constraint) ? constraint : [constraint];
+  return list.some((one) => {
+    if (typeof one !== 'string') return true;
+    return one.trim().split(/\s+/).every((pred) => satisfiesOne(version, pred));
+  });
+}
+
+function fmtConstraint(c) {
+  return (Array.isArray(c) ? c : [c]).filter((x) => typeof x === 'string').join(' или ') || '*';
+}
+
+/** Версия мода из строки Modrinth («mc1.21.11-0.8.13-fabric» → «0.8.13»). */
+function guessModVersion(versionNumber, mcVersion) {
+  const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let s = String(versionNumber || '');
+  s = s.replace(new RegExp('mc' + esc(mcVersion), 'gi'), ' ');
+  s = s.replace(new RegExp(esc(mcVersion), 'g'), ' ');
+  s = s.replace(/\b(fabric|forge|neoforge|quilt)\b/gi, ' ');
+  const m = s.match(/(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z][0-9A-Za-z.]*)?)/);
+  return m ? m[1] : null;
 }
 
 /**
- * Сверка жёстких зависимостей установленных модов: если мод требует ТОЧНУЮ
- * версию другого УСТАНОВЛЕННОГО мода, а стоит другая — переустанавливаем
- * требуемую (ищем на Modrinth по version_number). Сеть упала — молча выходим.
+ * Сверка требований установленных модов друг к другу по fabric.mod.json —
+ * ЕДИНСТВЕННЫЙ авторитет по версиям (пины Modrinth = лишь «с чем тестировали»).
+ * Собираем ВСЕ требования на каждый мод (точные и диапазоны), и если стоящая
+ * версия хоть одно нарушает — ставим самую свежую, устраивающую ВСЕХ сразу.
+ * Классический кейс: Iris пинил Sodium 0.8.7, а Sodium Extra требует >=0.8.13 →
+ * игра падала на старте; теперь выбирается 0.8.13, подходящий обоим.
+ * Сеть упала — молча выходим, играем как есть.
  */
 async function enforceJarDeps(gameDir, loader, mcVersion, log) {
   if (loader !== 'fabric') return;
@@ -605,34 +737,49 @@ async function enforceJarDeps(gameDir, loader, mcVersion, log) {
     byModId.set(info.id, { entry: e, version: info.version });
     infos.push({ entry: e, info });
   }
+
+  // modid → [{by, constraint}] по всем установленным модам
+  const wants = new Map();
   for (const { entry, info } of infos) {
-    for (const [depId, constraint] of Object.entries(info.depends)) {
-      const want = exactConstraint(constraint);
-      if (!want) continue;
-      const have = byModId.get(depId);
-      if (!have || have.version === want) continue; // не наш мод или уже та версия
-      log('⚑ ' + entry.title + ' требует ' + have.entry.title + ' ' + want
-        + ', стоит ' + have.version + ' — меняю версию');
-      try {
-        const versions = await apiGet(API + '/project/'
-          + encodeURIComponent(have.entry.projectId) + '/version?loaders='
-          + encodeURIComponent(JSON.stringify([loader])));
-        const target = (versions || []).find((v) => v.version_number === want)
-          || (versions || []).find((v) => v.version_number.endsWith('-' + want)
-            || v.version_number.endsWith(want));
-        if (!target) {
-          log('  ! версия ' + want + ' не нашлась на Modrinth — пропускаю');
-          continue;
-        }
-        await installContent(gameDir, {
-          projectId: have.entry.projectId,
-          slug: have.entry.slug,
-          title: have.entry.title,
-          iconUrl: have.entry.iconUrl || '',
-        }, 'mod', loader, mcVersion, log, 4, target.id);
-      } catch (e2) {
-        log('  ! не удалось привести версию: ' + e2.message);
+    for (const [depId, constraint] of Object.entries(info.depends || {})) {
+      if (depId === info.id || !byModId.has(depId)) continue; // не наш управляемый мод
+      if (!wants.has(depId)) wants.set(depId, []);
+      wants.get(depId).push({ by: entry.title, constraint });
+    }
+  }
+
+  for (const [depId, reqs] of wants) {
+    const have = byModId.get(depId);
+    const bad = reqs.filter((r) => !satisfies(have.version, r.constraint));
+    if (!bad.length) continue;
+    log('⚑ ' + have.entry.title + ' ' + have.version + ' не устраивает: '
+      + bad.map((r) => r.by + ' требует ' + fmtConstraint(r.constraint)).join('; ')
+      + ' — подбираю версию');
+    try {
+      const versions = await apiGet(API + '/project/'
+        + encodeURIComponent(have.entry.projectId) + '/version?loaders='
+        + encodeURIComponent(JSON.stringify([loader]))
+        + '&game_versions=' + encodeURIComponent(JSON.stringify([mcVersion])));
+      // версия должна устраивать ВСЕ требования разом, не только нарушенные
+      const fits = (versions || [])
+        .map((v) => ({ v, ver: guessModVersion(v.version_number, mcVersion) }))
+        .filter((c) => c.ver && reqs.every((r) => satisfies(c.ver, r.constraint)));
+      // API отдаёт от новых к старым; стабильную предпочитаем бете
+      const pick = fits.find((c) => c.v.version_type === 'release') || fits[0];
+      if (!pick) {
+        log('  ! под ' + mcVersion + ' нет версии ' + have.entry.title
+          + ', устраивающей все моды — выключи один из конфликтующих');
+        continue;
       }
+      log('  → ' + have.entry.title + ' ' + have.version + ' → ' + pick.ver);
+      await installContent(gameDir, {
+        projectId: have.entry.projectId,
+        slug: have.entry.slug,
+        title: have.entry.title,
+        iconUrl: have.entry.iconUrl || '',
+      }, 'mod', loader, mcVersion, log, 4, pick.v.id);
+    } catch (e2) {
+      log('  ! не удалось привести версию: ' + e2.message);
     }
   }
 }
@@ -695,6 +842,60 @@ function syncMods(gameDir, loader, bundledDir, log) {
   }
 }
 
+// ── сборка игрока: экспорт кодом и применение ───────────────────────────
+/**
+ * Что игрок поставил САМ (вшитые моды Mist MC не включаем — они и так есть
+ * у каждого). Версии сохраняем поимённо: смысл кода сборки в том, чтобы у
+ * друга собралось ровно то же, а не «примерно похожее».
+ */
+function exportBuild(gameDir, loader) {
+  const m = readManifest(gameDir);
+  const items = m.user
+    .filter((e) => !e.pendingRemove && (e.type !== 'mod' || e.loader === loader))
+    .map((e) => ({
+      projectId: e.projectId,
+      slug: e.slug,
+      title: e.title,
+      iconUrl: e.iconUrl || '',
+      type: e.type || 'mod',
+      versionId: e.versionId || null,
+      versionNumber: e.versionNumber || '',
+      enabled: e.enabled !== false,
+    }));
+  return { loader, items, bundledDisabled: m.bundledDisabled || [] };
+}
+
+/**
+ * Применить чужую сборку: доставить недостающее. Уже стоящее не трогаем и
+ * ничего не удаляем — игрок делится сборкой, а не стирает чужие моды.
+ * Возвращает сводку для UI.
+ */
+async function applyBuild(gameDir, build, mcVersion, log) {
+  const loader = build && build.loader === 'forge' ? 'forge' : 'fabric';
+  const items = Array.isArray(build && build.items) ? build.items : [];
+  const summary = { installed: [], already: [], failed: [], loader };
+  for (const it of items) {
+    if (!it || !it.projectId) continue;
+    const type = TYPES[it.type] ? it.type : 'mod';
+    try {
+      const res = await installContent(
+        gameDir,
+        { projectId: it.projectId, slug: it.slug, title: it.title, iconUrl: it.iconUrl || '' },
+        type, loader, mcVersion, log, 0, it.versionId || null,
+      );
+      if (res && res.ok) (res.already ? summary.already : summary.installed).push(it.title || it.slug);
+      else summary.failed.push((it.title || it.slug) + ': ' + ((res && res.error) || '?'));
+    } catch (e) {
+      summary.failed.push((it.title || it.slug) + ': ' + e.message);
+    }
+  }
+  // после массовой установки приводим версии в согласие (см. enforceJarDeps)
+  try {
+    await enforceJarDeps(gameDir, loader, mcVersion, log);
+  } catch (_) { /* сеть — играем как есть */ }
+  return summary;
+}
+
 // ── инвентаризация клиента для хартбита ─────────────────────────────────
 /**
  * Что РЕАЛЬНО лежит в папке игры перед запуском — включая закинутое руками
@@ -749,6 +950,7 @@ module.exports = {
   listContent,
   searchContent,
   popularContent,
+  projectDetails,
   installContent,
   toggleUserContent,
   toggleBundledMod,
@@ -756,4 +958,11 @@ module.exports = {
   syncMods,
   enforceJarDeps,
   collectClientInventory,
+  exportBuild,
+  applyBuild,
+  // разбор версий — чистые функции, вынесены наружу для тестов
+  satisfies,
+  guessModVersion,
+  cmpVer,
+  parseVer,
 };

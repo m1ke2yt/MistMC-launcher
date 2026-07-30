@@ -30,9 +30,26 @@ if (!window.api) {
     modInstall: async () => ({ ok: false, error: 'предпросмотр' }),
     modToggle: async () => ({ ok: true }),
     modRemove: async () => ({ ok: true }),
+    communityVote: async () => ({ ok: true, rating: { likes: 1, dislikes: 0, mine: 1 } }),
+    communityRatings: async () => ({ ok: true, ratings: [] }),
+    communityTop: async () => ({ ok: true, top: [] }),
+    buildShare: async () => ({ ok: true, code: 'K7M2QP', reused: false }),
+    buildApply: async () => ({ ok: false, error: 'предпросмотр' }),
+    modDetails: async () => ({
+      ok: true,
+      project: {
+        projectId: 'demo0', slug: 'demo0', title: 'Демо-мод', iconUrl: '',
+        description: 'Русское описание для предпросмотра', downloads: 12345678,
+        body: '# Demo mod\n\nFull **description** for modal preview.\n\n[Site link](https://mistmc.gg) and `code`.',
+        bodyRu: '# Демо-мод\n\nПолное **описание** для предпросмотра модалки.\n\n[Ссылка на сайт](https://mistmc.gg) и `код`.',
+        descriptionRu: null,
+        gallery: [],
+      },
+    }),
+    openGameDir: async () => ({ ok: true }),
     openExternal: noop, minimize: noop, close: noop,
     onProgress: noop, onStatus: noop, onLog: noop, onState: noop,
-    onLaunchError: noop, onAuthExpired: noop,
+    onLaunchError: noop, onAuthExpired: noop, onUpdateState: noop,
   };
 }
 
@@ -56,6 +73,7 @@ const els = {
   discordRpc: $('discordRpc'),
   gameDir: $('gameDir'),
   btnDir: $('btn-dir'),
+  btnOpenDir: $('btn-open-dir'),
   btnPlay: $('btn-play'),
   status: $('status'),
   progressBar: $('progress-bar'),
@@ -78,6 +96,28 @@ const els = {
   listResults: $('list-results'),
   secResults: $('sec-results'),
   resultsTitle: $('results-title'),
+  // модалка мода
+  modOverlay: $('mod-overlay'),
+  modmIcon: $('modm-icon'),
+  modmTitle: $('modm-title'),
+  modmDownloads: $('modm-downloads'),
+  modmLink: $('modm-link'),
+  modmLang: $('modm-lang'),
+  modmLinkSep: $('modm-linksep'),
+  modmClose: $('modm-close'),
+  modmGallery: $('modm-gallery'),
+  modmGalImg: $('modm-galimg'),
+  modmPrev: $('modm-prev'),
+  modmNext: $('modm-next'),
+  modmGalCount: $('modm-galcount'),
+  modmBody: $('modm-body'),
+  modmHint: $('modm-hint'),
+  modmInstall: $('modm-install'),
+  modmLike: $('modm-like'),
+  modmDislike: $('modm-dislike'),
+  modmLikes: $('modm-likes'),
+  modmDislikes: $('modm-dislikes'),
+  resultsMode: $('results-mode'),
   // модалка
   loginOverlay: $('login-overlay'),
   modalClose: $('modal-close'),
@@ -102,6 +142,8 @@ const state = {
   installedIds: new Set(), // projectId установленных текущего типа
   lastHits: [],
   filterQuery: '', // текст из поиска фильтрует и список установленных
+  resultsMode: 'popular', // popular = подборка Modrinth | top = топ игроков
+  ratings: new Map(), // projectId → { likes, dislikes, mine }
 };
 
 const CTYPE_HINTS = {
@@ -129,6 +171,43 @@ function setProgress(percent) {
     els.progressBar.classList.remove('indeterminate');
     els.progressBar.style.width = percent + '%';
   }
+}
+
+// ── плавность: показ/скрытие оверлеев и перезапуск анимаций ─────────────
+// Закрытие даём доиграть (класс closing в CSS), поэтому hidden ставим по
+// таймеру; повторное открытие таймер отменяет — иначе окно спрячется само.
+const closeTimers = new WeakMap();
+const CLOSE_MS = 140;
+
+function openOverlay(el) {
+  const t = closeTimers.get(el);
+  if (t) { clearTimeout(t); closeTimers.delete(el); }
+  el.classList.remove('closing');
+  el.hidden = false;
+}
+
+function closeOverlay(el) {
+  if (el.hidden || closeTimers.has(el)) return;
+  el.classList.add('closing');
+  closeTimers.set(el, setTimeout(() => {
+    closeTimers.delete(el);
+    el.classList.remove('closing');
+    el.hidden = true;
+  }, CLOSE_MS));
+}
+
+/** Перезапустить CSS-анимацию класса на элементе (нужен reflow). */
+function replayAnim(el, cls) {
+  el.classList.remove(cls);
+  void el.offsetWidth;
+  el.classList.add(cls);
+}
+
+/** Лёгкая «лесенка» появления списка — первые строки заметно, дальше без задержки. */
+function stagger(list) {
+  [...list.children].forEach((row, i) => {
+    row.style.animationDelay = Math.min(i * 22, 220) + 'ms';
+  });
 }
 
 function fmtDownloads(n) {
@@ -181,11 +260,11 @@ function openLogin() {
   els.nickError.hidden = true;
   els.msError.hidden = true;
   els.nickInput.value = state.account && state.account.type === 'offline' ? state.account.name : '';
-  els.loginOverlay.hidden = false;
+  openOverlay(els.loginOverlay);
   setTimeout(() => els.nickInput.focus(), 30);
 }
 function closeLogin() {
-  els.loginOverlay.hidden = true;
+  closeOverlay(els.loginOverlay);
 }
 
 async function doNickLogin() {
@@ -300,6 +379,15 @@ function installedRow(mod, bundled, foreign) {
   meta.append(t, s);
   row.appendChild(meta);
 
+  // клик по строке (не по управлению) — карточка мода; у вшитых нет projectId
+  if (!bundled && mod.projectId) {
+    row.classList.add('clickable');
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.mod-controls')) return;
+      openModModal(mod);
+    });
+  }
+
   const controls = document.createElement('div');
   controls.className = 'mod-controls';
   const ctype = state.contentType;
@@ -380,9 +468,10 @@ async function refreshModsView() {
     empty.className = 'mods-empty';
     empty.textContent = q
       ? 'Среди установленных ничего не найдено по «' + state.filterQuery + '»'
-      : 'Пока пусто — выбери что-нибудь из подборки ниже или найди через поиск.';
+      : 'Пока пусто — поставь что-нибудь из каталога или найди через поиск.';
     els.listInstalled.appendChild(empty);
   }
+  stagger(els.listInstalled);
 }
 
 function renderResults(hits) {
@@ -407,13 +496,29 @@ function renderResults(hits) {
     t.textContent = h.title;
     const dl = document.createElement('span');
     dl.className = 'mod-dl';
-    dl.textContent = '⬇ ' + fmtDownloads(h.downloads);
+    dl.textContent = h.rating
+      ? '👍 ' + h.rating.likes + (h.rating.dislikes ? ' · 👎 ' + h.rating.dislikes : '')
+      : '⬇ ' + fmtDownloads(h.downloads);
     t.appendChild(dl);
+    // счётчик оценок появится, когда ответит сайт (в топе он уже в строке)
+    if (!h.rating) {
+      const vote = document.createElement('span');
+      vote.className = 'mod-dl mod-votes';
+      vote.dataset.ratingFor = h.projectId;
+      vote.hidden = true;
+      t.appendChild(vote);
+    }
     const s = document.createElement('div');
     s.className = 'mod-sub';
     s.textContent = h.description;
     meta.append(t, s);
     row.appendChild(meta);
+
+    row.classList.add('clickable');
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.mod-controls')) return;
+      openModModal(h);
+    });
 
     const controls = document.createElement('div');
     controls.className = 'mod-controls';
@@ -444,6 +549,8 @@ function renderResults(hits) {
     row.appendChild(controls);
     els.listResults.appendChild(row);
   }
+  stagger(els.listResults);
+  loadRatings(hits.map((h) => h.projectId));
 }
 
 const CTYPE_POPULAR_TITLES = {
@@ -452,27 +559,67 @@ const CTYPE_POPULAR_TITLES = {
   shader: 'Популярные шейдеры',
 };
 
+const CTYPE_TOP_TITLES = {
+  mod: 'Топ модов по оценкам игроков',
+  resourcepack: 'Топ ресурспаков по оценкам игроков',
+  shader: 'Топ шейдеров по оценкам игроков',
+};
+
+/** Записи топа приводим к виду карточек поиска (готовые оценки уже внутри). */
+function topToHits(top) {
+  return (top || []).map((e) => ({
+    projectId: e.projectId,
+    slug: e.slug || e.projectId,
+    title: e.title || e.slug || e.projectId,
+    description: 'Оценка игроков Mist MC: ' + (e.score > 0 ? '+' : '') + e.score,
+    iconUrl: e.iconUrl || '',
+    downloads: 0,
+    rating: { likes: e.likes, dislikes: e.dislikes, mine: state.ratings.get(e.projectId)?.mine || 0 },
+  }));
+}
+
 let searching = false;
 async function doSearch() {
   if (searching || (state.contentType === 'mod' && state.loader === 'vanilla')) return;
   searching = true;
   const q = els.modQuery.value.trim();
-  els.resultsTitle.textContent = q ? 'Результаты: «' + q + '»' : CTYPE_POPULAR_TITLES[state.contentType];
+  const topMode = state.resultsMode === 'top' && !q;
+  els.resultsTitle.textContent = q
+    ? 'Результаты: «' + q + '»'
+    : topMode ? CTYPE_TOP_TITLES[state.contentType] : CTYPE_POPULAR_TITLES[state.contentType];
   els.secResults.hidden = false;
+  // топ и поиск поднимаем над «Установленными» — иначе за ними приходилось скроллить
+  els.secResults.classList.toggle('first', topMode || !!q);
+  els.modsBody.scrollTop = 0;
   els.listResults.replaceChildren();
   const loading = document.createElement('div');
   loading.className = 'mods-empty';
-  loading.textContent = q ? 'Ищу на Modrinth…' : 'Загружаю подборку…';
+  loading.textContent = q ? 'Ищу на Modrinth…' : topMode ? 'Считаю оценки игроков…' : 'Загружаю подборку…';
   els.listResults.appendChild(loading);
-  // пустой запрос = кураторская подборка с русскими описаниями
-  const res = q
-    ? await window.api.modsSearch(q, state.contentType, state.loader)
-    : await window.api.modsPopular(state.contentType, state.loader);
+  // пустой запрос = кураторская подборка (или топ игроков, если выбран режим)
+  let res;
+  if (q) {
+    res = await window.api.modsSearch(q, state.contentType, state.loader);
+  } else if (topMode) {
+    const t = await window.api.communityTop(state.contentType);
+    res = t && t.ok
+      ? { ok: true, hits: topToHits(t.top) }
+      : { ok: false, error: 'Топ недоступен: ' + ((t && t.error) || 'сайт не отвечает') };
+  } else {
+    res = await window.api.modsPopular(state.contentType, state.loader);
+  }
   searching = false;
+  if (res && res.ok && topMode && !res.hits.length) {
+    els.listResults.replaceChildren();
+    const empty = document.createElement('div');
+    empty.className = 'mods-empty';
+    empty.textContent = 'Пока никто не голосовал. Открой мод и поставь 👍 — попадёт в топ.';
+    els.listResults.appendChild(empty);
+    state.lastHits = [];
+    return;
+  }
   if (res && res.ok) {
     renderResults(res.hits);
-    // сразу показываем найденное, а не заставляем листать мимо установленных
-    if (q) els.secResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } else {
     els.listResults.replaceChildren();
     const err = document.createElement('div');
@@ -481,6 +628,356 @@ async function doSearch() {
     els.listResults.appendChild(err);
   }
 }
+
+// ── мини-рендер Markdown (описания Modrinth) ───────────────────────────
+// Безопасен для XSS: DOM строится только через textContent/атрибуты, сырой
+// HTML из описания в разметку не попадает (картинки конвертируем, теги режем).
+function mdDecodeEntities(s) {
+  return s.replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (_, e) => ({
+    amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", apos: "'", nbsp: ' ',
+  }[e]));
+}
+
+const HTTPS_RE = /^https:\/\//i;
+
+function mdLink(url, child) {
+  const a = document.createElement('a');
+  a.href = '#';
+  a.appendChild(child);
+  a.addEventListener('click', (e) => { e.preventDefault(); window.api.openExternal(url); });
+  return a;
+}
+
+function mdImage(url, alt, cls) {
+  const img = document.createElement('img');
+  img.className = cls;
+  img.alt = alt || '';
+  img.src = url;
+  img.addEventListener('error', () => img.remove()); // битую картинку не показываем
+  return img;
+}
+
+function mdInline(el, text) {
+  // Токены. ПЕРВЫМ идёт бейдж [![alt](картинка)](ссылка) — им начинается почти
+  // каждое описание на Modrinth; без отдельной ветки внешние скобки съедала
+  // ветка ссылки, и на экран лезли куски разметки вида «![Environment]()».
+  const re = new RegExp([
+    /\[!\[([^\]]*)\]\(([^)\s]*)\)\]\(([^)\s]*)\)/,   // 1 alt, 2 картинка, 3 ссылка
+    /!\[([^\]]*)\]\(([^)\s]*)\)/,                    // 4 alt, 5 картинка
+    /\[([^\]]+)\]\(([^)\s]*)\)/,                     // 6 текст, 7 ссылка
+    /\*\*([^*]+)\*\*/,                               // 8 жирный
+    /`([^`]+)`/,                                     // 9 код
+  ].map((r) => r.source).join('|'), 'g');
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
+    if (m[2] !== undefined) {
+      // бейдж: маленькая картинка, по клику — ссылка
+      if (HTTPS_RE.test(m[2])) {
+        const img = mdImage(m[2], m[1], 'md-badge');
+        el.appendChild(HTTPS_RE.test(m[3]) ? mdLink(m[3], img) : img);
+      } else if (m[1] && HTTPS_RE.test(m[3])) {
+        el.appendChild(mdLink(m[3], document.createTextNode(m[1])));
+      }
+      // иначе бейдж без пригодных ссылок — молча пропускаем, не сорим разметкой
+    } else if (m[5] !== undefined) {
+      if (HTTPS_RE.test(m[5])) el.appendChild(mdImage(m[5], m[4], 'md-img'));
+      else if (m[4]) el.appendChild(document.createTextNode(m[4]));
+    } else if (m[6] !== undefined) {
+      const txt = document.createTextNode(m[6]);
+      el.appendChild(HTTPS_RE.test(m[7]) ? mdLink(m[7], txt) : txt);
+    } else if (m[8] !== undefined) {
+      const b = document.createElement('b');
+      b.textContent = m[8];
+      el.appendChild(b);
+    } else if (m[9] !== undefined) {
+      const c = document.createElement('code');
+      c.textContent = m[9];
+      el.appendChild(c);
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) el.appendChild(document.createTextNode(text.slice(last)));
+}
+
+function renderMarkdown(md) {
+  const frag = document.createDocumentFragment();
+  if (!md) return frag;
+  let s = md.replace(/\r\n/g, '\n');
+  // HTML-вставки, которыми любят злоупотреблять описания на Modrinth:
+  // <img> превращаем в markdown-картинку, блочные теги — в переводы строк,
+  // остальные теги вырезаем (текст внутри остаётся).
+  s = s.replace(/<img[^>]*?src=["']([^"']+)["'][^>]*>/gi, (_, u) => (/^https:\/\//i.test(u) ? '\n![](' + u + ')\n' : '\n'));
+  s = s.replace(/<br\s*\/?>/gi, '\n');
+  s = s.replace(/<\/?(p|div|h[1-6]|details|summary|center|ul|ol|li|blockquote|table|thead|tbody|tr|td|th)[^>]*>/gi, '\n');
+  s = s.replace(/<[^>]{1,300}?>/g, '');
+  s = mdDecodeEntities(s);
+
+  let para = [];
+  let list = null;
+  let inCode = false;
+  let codeLines = [];
+  const flushPara = () => {
+    if (!para.length) return;
+    const p = document.createElement('p');
+    mdInline(p, para.join(' '));
+    frag.appendChild(p);
+    para = [];
+  };
+  const flushList = () => {
+    if (list) { frag.appendChild(list); list = null; }
+  };
+  for (const raw of s.split('\n')) {
+    const t = raw.trim();
+    if (/^```/.test(t)) {
+      if (inCode) {
+        const pre = document.createElement('pre');
+        pre.textContent = codeLines.join('\n');
+        frag.appendChild(pre);
+        codeLines = [];
+      } else { flushPara(); flushList(); }
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { codeLines.push(raw); continue; }
+    if (!t) { flushPara(); flushList(); continue; }
+    const h = t.match(/^(#{1,6})\s+(.*)$/);
+    if (h) {
+      flushPara(); flushList();
+      const el = document.createElement('div');
+      el.className = 'md-h md-h' + Math.min(3, h[1].length);
+      mdInline(el, h[2]);
+      frag.appendChild(el);
+      continue;
+    }
+    if (/^([-*_])\1{2,}$/.test(t)) { flushPara(); flushList(); frag.appendChild(document.createElement('hr')); continue; }
+    const li = t.match(/^(?:[-*•]|\d+[.)])\s+(.*)$/);
+    if (li) {
+      flushPara();
+      if (!list) list = document.createElement('ul');
+      const item = document.createElement('li');
+      mdInline(item, li[1]);
+      list.appendChild(item);
+      continue;
+    }
+    flushList();
+    para.push(t);
+  }
+  if (inCode && codeLines.length) {
+    const pre = document.createElement('pre');
+    pre.textContent = codeLines.join('\n');
+    frag.appendChild(pre);
+  }
+  flushPara();
+  flushList();
+  return frag;
+}
+
+// ── модалка мода (карточка как на Modrinth) ────────────────────────────
+const modm = { gallery: [], idx: 0, project: null, token: 0, showOriginal: false };
+
+// тело модалки: русский автоперевод по умолчанию, по кнопке — оригинал
+function modmRenderBody() {
+  const p = modm.project;
+  if (!p) return;
+  const hasRu = !!(p.bodyRu || p.descriptionRu);
+  els.modmLang.hidden = !hasRu;
+  els.modmLinkSep.hidden = !hasRu; // разделитель нужен, только если есть вторая ссылка
+  els.modmLang.textContent = modm.showOriginal ? 'показать оригинал ⇄ перевод' : 'оригинал (EN)';
+  const useRu = hasRu && !modm.showOriginal;
+  els.modmBody.replaceChildren();
+  const desc = useRu && p.descriptionRu ? p.descriptionRu : p.description;
+  if (desc) {
+    const lead = document.createElement('p');
+    lead.textContent = desc;
+    lead.style.color = 'var(--text-dim)';
+    els.modmBody.appendChild(lead);
+  }
+  els.modmBody.appendChild(renderMarkdown(useRu && p.bodyRu ? p.bodyRu : p.body));
+  replayAnim(els.modmBody, 'md-fade');
+}
+
+function modmShowImage() {
+  if (!modm.gallery.length) { els.modmGallery.hidden = true; return; }
+  els.modmGallery.hidden = false;
+  els.modmGalImg.src = modm.gallery[modm.idx].url;
+  els.modmGalImg.alt = modm.gallery[modm.idx].title || '';
+  replayAnim(els.modmGalImg, 'gal-fade');
+  els.modmGalCount.textContent = (modm.idx + 1) + ' / ' + modm.gallery.length;
+  const many = modm.gallery.length > 1;
+  els.modmPrev.hidden = !many;
+  els.modmNext.hidden = !many;
+}
+
+// ── оценки игроков ──────────────────────────────────────────────────────
+function applyRating(projectId, r) {
+  if (!r) return;
+  state.ratings.set(projectId, r);
+}
+
+/** Подтянуть оценки для показанных карточек и обновить бейджи в списке. */
+async function loadRatings(ids) {
+  const need = ids.filter(Boolean);
+  if (!need.length) return;
+  const res = await window.api.communityRatings(need);
+  if (!res || !res.ok) return; // сайт недоступен — просто не показываем оценки
+  for (const r of res.ratings || []) applyRating(r.projectId, r);
+  // дорисовываем счётчики в уже отрисованных строках
+  for (const el of document.querySelectorAll('[data-rating-for]')) {
+    const r = state.ratings.get(el.dataset.ratingFor);
+    if (r && (r.likes || r.dislikes)) {
+      el.textContent = '👍 ' + r.likes + (r.dislikes ? ' · 👎 ' + r.dislikes : '');
+      el.hidden = false;
+    }
+  }
+  if (modm.project && state.ratings.has(modm.project.projectId)) modmRenderVote();
+}
+
+function modmRenderVote() {
+  const p = modm.project;
+  if (!p) return;
+  const r = state.ratings.get(p.projectId) || { likes: 0, dislikes: 0, mine: 0 };
+  els.modmLikes.textContent = r.likes;
+  els.modmDislikes.textContent = r.dislikes;
+  els.modmLike.classList.toggle('voted', r.mine > 0);
+  els.modmDislike.classList.toggle('voted', r.mine < 0);
+  const noAcc = !state.account;
+  els.modmLike.disabled = noAcc;
+  els.modmDislike.disabled = noAcc;
+  els.modmLike.title = noAcc ? 'Войдите, чтобы оценивать' : 'Нравится';
+  els.modmDislike.title = noAcc ? 'Войдите, чтобы оценивать' : 'Не нравится';
+}
+
+async function sendVote(value) {
+  const p = modm.project;
+  if (!p || !p.projectId) return;
+  const cur = state.ratings.get(p.projectId) || { likes: 0, dislikes: 0, mine: 0 };
+  // повторный клик по своей оценке снимает её
+  const next = cur.mine === value ? 0 : value;
+  els.modmLike.disabled = true;
+  els.modmDislike.disabled = true;
+  const res = await window.api.communityVote({
+    projectId: p.projectId, slug: p.slug, title: p.title,
+    iconUrl: p.iconUrl || '', type: state.contentType,
+  }, next);
+  if (res && res.ok && res.rating) {
+    applyRating(p.projectId, res.rating);
+    els.modmHint.textContent = '';
+  } else {
+    els.modmHint.textContent = 'Оценка не сохранилась: ' + ((res && res.error) || 'сайт недоступен');
+  }
+  modmRenderVote();
+}
+
+function modmUpdateInstallBtn() {
+  const p = modm.project;
+  if (!p) return;
+  if (state.installedIds.has(p.projectId)) {
+    els.modmInstall.textContent = '✓ Установлен';
+    els.modmInstall.disabled = true;
+  } else {
+    els.modmInstall.textContent = '⬇ Скачать';
+    els.modmInstall.disabled = false;
+  }
+}
+
+async function openModModal(hit) {
+  const token = ++modm.token;
+  modm.project = { ...hit };
+  modm.gallery = [];
+  modm.idx = 0;
+  modm.showOriginal = false;
+  els.modmLang.hidden = true;
+  els.modmLinkSep.hidden = true;
+  // мгновенно показываем то, что уже знаем из строки списка
+  els.modmTitle.textContent = hit.title || hit.slug || '';
+  els.modmDownloads.textContent = hit.downloads ? '⬇ ' + fmtDownloads(hit.downloads) : '';
+  els.modmHint.textContent = '';
+  els.modmIcon.replaceChildren(modIcon(hit.iconUrl, hit.title).firstChild || document.createTextNode((hit.title || '?')[0].toUpperCase()));
+  els.modmGallery.hidden = true;
+  els.modmBody.replaceChildren();
+  const loading = document.createElement('div');
+  loading.className = 'md-loading';
+  loading.textContent = 'Загружаю описание с Modrinth…';
+  els.modmBody.appendChild(loading);
+  modmUpdateInstallBtn();
+  modmRenderVote();
+  loadRatings([hit.projectId]);
+  openOverlay(els.modOverlay);
+
+  const res = await window.api.modDetails(hit.slug || hit.projectId);
+  if (token !== modm.token || els.modOverlay.hidden) return; // закрыли/открыли другой
+  els.modmBody.replaceChildren();
+  if (!res || !res.ok) {
+    const err = document.createElement('div');
+    err.className = 'md-loading';
+    err.textContent = (res && res.error) || 'Modrinth недоступен — попробуй ещё раз.';
+    els.modmBody.appendChild(err);
+    return;
+  }
+  const p = res.project;
+  modm.project = p;
+  els.modmTitle.textContent = p.title;
+  els.modmDownloads.textContent = '⬇ ' + fmtDownloads(p.downloads);
+  els.modmIcon.replaceChildren(modIcon(p.iconUrl, p.title).firstChild || document.createTextNode((p.title || '?')[0].toUpperCase()));
+  modm.gallery = p.gallery || [];
+  modm.idx = 0;
+  modmShowImage();
+  modmRenderBody();
+  modmUpdateInstallBtn();
+  modmRenderVote();
+}
+
+function closeModModal() {
+  modm.token++;
+  closeOverlay(els.modOverlay);
+  // картинку чистим после анимации — иначе кадр закрытия «мигает» пустотой
+  setTimeout(() => { if (els.modOverlay.hidden) els.modmGalImg.src = ''; }, CLOSE_MS + 20);
+}
+
+els.modmClose.addEventListener('click', closeModModal);
+els.modOverlay.addEventListener('click', (e) => { if (e.target === els.modOverlay) closeModModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !els.modOverlay.hidden) closeModModal(); });
+els.modmPrev.addEventListener('click', () => {
+  modm.idx = (modm.idx - 1 + modm.gallery.length) % modm.gallery.length;
+  modmShowImage();
+});
+els.modmNext.addEventListener('click', () => {
+  modm.idx = (modm.idx + 1) % modm.gallery.length;
+  modmShowImage();
+});
+els.modmLike.addEventListener('click', () => sendVote(1));
+els.modmDislike.addEventListener('click', () => sendVote(-1));
+els.modmLang.addEventListener('click', () => {
+  modm.showOriginal = !modm.showOriginal;
+  modmRenderBody();
+});
+els.modmLink.addEventListener('click', () => {
+  const p = modm.project;
+  if (p && p.slug) window.api.openExternal('https://modrinth.com/' + (state.contentType === 'mod' ? 'mod' : state.contentType) + '/' + p.slug);
+});
+els.modmInstall.addEventListener('click', async () => {
+  const p = modm.project;
+  if (!p || !p.projectId) return;
+  els.modmInstall.disabled = true;
+  els.modmInstall.textContent = 'Скачиваю…';
+  els.modmHint.textContent = '';
+  const res = await window.api.modInstall({
+    projectId: p.projectId, slug: p.slug, title: p.title,
+    iconUrl: p.iconUrl || '', description: p.description || '',
+  }, state.contentType, state.loader);
+  if (res && res.ok) {
+    state.installedIds.add(p.projectId);
+    els.modmInstall.textContent = '✓ Установлен';
+    refreshModsView();
+    renderResults(state.lastHits);
+  } else {
+    els.modmInstall.disabled = false;
+    els.modmInstall.textContent = '⬇ Скачать';
+    els.modmHint.textContent = 'Ошибка: ' + ((res && res.error) || 'не удалось установить');
+  }
+});
 
 // ── init ────────────────────────────────────────────────────────────────
 async function init() {
@@ -522,6 +1019,10 @@ els.loader.addEventListener('click', (e) => {
 els.btnDir.addEventListener('click', async () => {
   const dir = await window.api.pickDir();
   if (dir) { state.gameDir = dir; els.gameDir.value = dir; persist(); }
+});
+els.btnOpenDir.addEventListener('click', async () => {
+  const res = await window.api.openGameDir();
+  if (res && !res.ok) els.status.textContent = 'Не удалось открыть папку: ' + (res.error || '?');
 });
 
 els.tabs.addEventListener('click', (e) => {
@@ -568,6 +1069,16 @@ els.contentTypes.addEventListener('click', (e) => {
   const b = e.target.closest('.ctype');
   if (b && b.dataset.ctype !== state.contentType) setContentType(b.dataset.ctype);
 });
+els.resultsMode.addEventListener('click', (e) => {
+  const b = e.target.closest('.segm');
+  if (!b || b.dataset.mode === state.resultsMode) return;
+  state.resultsMode = b.dataset.mode;
+  for (const x of els.resultsMode.querySelectorAll('.segm')) x.classList.toggle('active', x === b);
+  els.modQuery.value = '';   // топ показывается только для пустого поиска
+  state.filterQuery = '';
+  refreshModsView();
+  doSearch();
+});
 
 els.btnPlay.addEventListener('click', async () => {
   if (!state.account) { openLogin(); return; }
@@ -606,12 +1117,34 @@ window.api.onAuthExpired(() => {
   updateAccountUI();
   openLogin();
 });
-if (window.api.onUpdateReady) {
-  window.api.onUpdateReady((d) => {
+// Мягкое обновление: одна кнопка в футере. Пока качается — показывает процент;
+// клик в любой момент = «обнови и перезапусти» (тихая установка без мастера NSIS).
+let updClicked = false;
+let updVersion = '';
+if (window.api.onUpdateState) {
+  window.api.onUpdateState((d) => {
+    if (!d || d.state === 'error') { if (!updClicked) els.btnUpdate.hidden = true; return; }
+    if (d.version) updVersion = d.version;
     els.btnUpdate.hidden = false;
-    els.btnUpdate.title = 'Версия ' + (d && d.version ? d.version : '') + ' скачана. Установится и за секунду перезапустит лаунчер.';
+    if (d.state === 'available') {
+      els.btnUpdate.disabled = false;
+      els.btnUpdate.textContent = '⬆ Обновить до ' + updVersion;
+    } else if (d.state === 'downloading') {
+      const pct = typeof d.percent === 'number' && d.percent >= 0 ? ' ' + d.percent + '%' : '…';
+      els.btnUpdate.textContent = updClicked ? '⬇ Загрузка' + pct + ' — установится сам' : '⬆ Обновить · ⬇' + pct;
+    } else if (d.state === 'ready') {
+      // если юзер уже нажал — main сам тихо переустановит и перезапустит
+      els.btnUpdate.disabled = false;
+      els.btnUpdate.textContent = updClicked ? '⬆ Устанавливаю…' : '⬆ Обновить до ' + updVersion;
+    }
+    els.btnUpdate.title = 'Мягкое обновление: скачается и тихо перезапустит лаунчер — без окон установщика.';
   });
-  els.btnUpdate.addEventListener('click', () => window.api.updateRestart());
+  els.btnUpdate.addEventListener('click', () => {
+    updClicked = true;
+    els.btnUpdate.disabled = true;
+    els.btnUpdate.textContent = '⬆ Обновляю…';
+    window.api.updateRestart();
+  });
 }
 window.api.onState((s) => {
   if (s.state === 'running') {
@@ -625,6 +1158,94 @@ window.api.onState((s) => {
 });
 
 init();
+
+// ── Код сборки: поделиться своим набором модов и применить чужой ──
+(() => {
+  const overlay = $('build-overlay');
+  const codeInput = $('build-code');
+  const makeBtn = $('build-make');
+  const copyBtn = $('build-copy');
+  const shareHint = $('build-share-hint');
+  const applyInput = $('build-input');
+  const applyBtn = $('build-apply');
+  const resultsBox = $('build-results');
+  if (!overlay) return;
+
+  function open(focusApply) {
+    resultsBox.hidden = true;
+    resultsBox.textContent = '';
+    shareHint.textContent = '';
+    // сбрасываем прошлый код: набор модов мог измениться с прошлого открытия
+    codeInput.value = '';
+    makeBtn.hidden = false;
+    copyBtn.hidden = true;
+    openOverlay(overlay);
+    if (focusApply) setTimeout(() => applyInput.focus(), 40);
+  }
+
+  $('btn-share-build').addEventListener('click', () => open(false));
+  $('btn-apply-build').addEventListener('click', () => open(true));
+  $('build-close').addEventListener('click', () => closeOverlay(overlay));
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeOverlay(overlay); });
+
+  makeBtn.addEventListener('click', async () => {
+    makeBtn.disabled = true;
+    makeBtn.textContent = 'Создаю…';
+    const res = await window.api.buildShare(state.loader);
+    makeBtn.disabled = false;
+    makeBtn.textContent = 'Создать код';
+    if (res && res.ok) {
+      codeInput.value = res.code;
+      // «Копировать» встаёт НА МЕСТО «Создать код»: три элемента в строку
+      // не помещались и кнопку выдавливало за край модалки
+      makeBtn.hidden = true;
+      copyBtn.hidden = false;
+      shareHint.textContent = res.reused
+        ? 'Этот код уже был создан для такой же сборки — им и делись.'
+        : 'Готово! Отправь код друзьям — у них соберётся то же самое.';
+    } else {
+      codeInput.value = '';
+      makeBtn.hidden = false;
+      copyBtn.hidden = true;
+      shareHint.textContent = 'Не получилось: ' + ((res && res.error) || 'сайт недоступен');
+    }
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    if (!codeInput.value) return;
+    try {
+      await navigator.clipboard.writeText(codeInput.value);
+      copyBtn.textContent = '✓ Скопировано';
+      setTimeout(() => { copyBtn.textContent = 'Копировать'; }, 1500);
+    } catch (_) {
+      codeInput.select(); // буфер недоступен — пусть скопирует руками
+    }
+  });
+
+  applyBtn.addEventListener('click', async () => {
+    const code = applyInput.value.trim();
+    if (!code) { applyInput.focus(); return; }
+    applyBtn.disabled = true;
+    applyBtn.textContent = 'Применяю…';
+    resultsBox.hidden = false;
+    resultsBox.textContent = 'Скачиваю моды сборки…';
+    const res = await window.api.buildApply(code);
+    applyBtn.disabled = false;
+    applyBtn.textContent = 'Применить';
+    if (!res || !res.ok) {
+      resultsBox.textContent = '✖ ' + ((res && res.error) || 'не удалось применить код');
+      return;
+    }
+    const s = res.summary || {};
+    const lines = ['Сборка игрока ' + (res.author || '?') + ':'];
+    if (s.installed?.length) lines.push('✓ поставлено: ' + s.installed.join(', '));
+    if (s.already?.length) lines.push('• уже было: ' + s.already.join(', '));
+    if (s.failed?.length) lines.push('✖ не вышло: ' + s.failed.join('; '));
+    if (!s.installed?.length && !s.already?.length) lines.push('в сборке нечего ставить');
+    resultsBox.textContent = lines.join('\n');
+    refreshModsView();
+  });
+})();
 
 // ── Перенос из другого лаунчера ──
 (() => {
@@ -686,7 +1307,7 @@ init();
   }
 
   async function openMigrate() {
-    overlay.hidden = false;
+    openOverlay(overlay);
     resultsBox.hidden = true;
     resultsBox.textContent = '';
     sources = (await window.api.migrateScan()) || [];
@@ -696,8 +1317,8 @@ init();
   // дубль в футере: из «Дополнительно» кнопку никто не находил
   const footerBtn = document.getElementById('btn-migrate-footer');
   if (footerBtn) footerBtn.addEventListener('click', openMigrate);
-  closeBtn.addEventListener('click', () => { overlay.hidden = true; });
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.hidden = true; });
+  closeBtn.addEventListener('click', () => closeOverlay(overlay));
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeOverlay(overlay); });
   sourceSel.addEventListener('change', updateHint);
 
   browseBtn.addEventListener('click', async () => {

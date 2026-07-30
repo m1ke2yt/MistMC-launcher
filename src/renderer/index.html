@@ -2,7 +2,8 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.modrinth.com https://mc-heads.net;" />
+  <!-- img-src https: — скриншоты и картинки описаний модов живут не только на cdn.modrinth.com (github/imgur и т.п.) -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;" />
   <title>Mist MC Launcher</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -57,12 +58,13 @@
           </div>
           <span class="hint" id="loader-hint">Fabric — рекомендуется, с модами Mist MC</span>
         </label>
-      </div>
 
-      <label class="field">
-        <span class="label">Оперативная память: <b id="ram-val">4096</b> МБ</span>
-        <input id="ram" type="range" min="2048" max="16384" step="512" value="4096" />
-      </label>
+        <label class="field field-ram">
+          <span class="label">Оперативная память: <b id="ram-val">4096</b> МБ</span>
+          <input id="ram" type="range" min="2048" max="16384" step="512" value="4096" />
+          <span class="hint scale"><span>2 ГБ</span><span>16 ГБ</span></span>
+        </label>
+      </div>
 
       <label class="checkbox">
         <input id="joinServer" type="checkbox" checked />
@@ -81,9 +83,10 @@
           <div class="row-inline">
             <input id="gameDir" type="text" readonly />
             <button id="btn-dir" class="btn-secondary">Обзор…</button>
+            <button id="btn-open-dir" class="btn-secondary" title="Открыть папку игры в проводнике">Открыть папку</button>
           </div>
         </label>
-        <button id="btn-migrate" class="btn-secondary">📦 Перенести настройки из другого лаунчера</button>
+        <button id="btn-migrate" class="btn-secondary">Перенести настройки из другого лаунчера</button>
       </details>
     </div>
 
@@ -100,27 +103,39 @@
     <div class="footer">
       <a href="#" id="link-site">mistmc.gg</a>
       <span class="dot">·</span>
-      <button id="btn-migrate-footer" class="link">📦 перенос из другого лаунчера</button>
-      <span class="dot">·</span>
       <span id="ver-line">Fabric 0.19.3 / Forge 61.1.0</span>
-      <button id="btn-update" class="btn-update" hidden>⬆ Обновление готово — перезапустить</button>
-      <button id="btn-log" class="link">лог</button>
+      <span class="footer-right">
+        <button id="btn-update" class="btn-update" hidden>⬆ Обновить</button>
+        <button id="btn-migrate-footer" class="link">перенос из другого лаунчера</button>
+        <span class="dot">·</span>
+        <button id="btn-log" class="link">лог</button>
+      </span>
     </div>
   </main>
 
   <!-- ══ Вкладка «Моды» ══ -->
   <main id="view-mods" hidden>
     <div class="mods-head">
-      <div class="content-types" id="content-types">
-        <button class="ctype active" data-ctype="mod">Моды</button>
-        <button class="ctype" data-ctype="resourcepack">Ресурспаки</button>
-        <button class="ctype" data-ctype="shader">Шейдеры</button>
+      <div class="mods-row">
+        <div class="content-types" id="content-types">
+          <button class="ctype active" data-ctype="mod">Моды</button>
+          <button class="ctype" data-ctype="resourcepack">Ресурспаки</button>
+          <button class="ctype" data-ctype="shader">Шейдеры</button>
+        </div>
+        <div class="mods-search">
+          <input id="mod-query" type="text" placeholder="Поиск на Modrinth… (Enter)" />
+          <button id="btn-mod-search" class="btn-secondary">Найти</button>
+        </div>
       </div>
-      <div class="mods-search">
-        <input id="mod-query" type="text" placeholder="Поиск на Modrinth… (Enter)" />
-        <button id="btn-mod-search" class="btn-secondary">Найти</button>
+      <div class="mods-tools">
+        <div class="seg-mini" id="results-mode">
+          <button class="segm active" data-mode="popular">Подборка</button>
+          <button class="segm" data-mode="top">Топ игроков</button>
+        </div>
+        <span class="hint" id="mods-loader-hint"></span>
+        <button id="btn-share-build" class="btn-secondary" title="Получить код своей сборки">Поделиться сборкой</button>
+        <button id="btn-apply-build" class="btn-secondary" title="Установить сборку по коду">Ввести код</button>
       </div>
-      <span class="hint" id="mods-loader-hint"></span>
     </div>
 
     <div class="mods-body" id="mods-body">
@@ -170,11 +185,80 @@
     </div>
   </div>
 
+  <!-- ══ Модалка мода (карточка как на Modrinth) ══ -->
+  <div class="overlay" id="mod-overlay" hidden>
+    <div class="modal modal-mod">
+      <div class="mod-head">
+        <div class="mod-icon mod-head-icon" id="modm-icon"></div>
+        <div class="mod-head-meta">
+          <div class="modal-title" id="modm-title"></div>
+          <div class="mod-head-sub">
+            <span class="mod-dl" id="modm-downloads"></span>
+            <button id="modm-link" class="link">открыть на Modrinth ↗</button>
+            <span class="dot" id="modm-linksep" hidden>·</span>
+            <button id="modm-lang" class="link" hidden title="Описание переведено автоматически (Google)"></button>
+          </div>
+        </div>
+        <button id="modm-close" class="winbtn">✕</button>
+      </div>
+      <div class="mod-modal-scroll">
+        <div class="mod-gallery" id="modm-gallery" hidden>
+          <img id="modm-galimg" alt="" />
+          <button class="gal-nav gal-prev" id="modm-prev">‹</button>
+          <button class="gal-nav gal-next" id="modm-next">›</button>
+          <span class="gal-count" id="modm-galcount"></span>
+        </div>
+        <div class="md" id="modm-body"></div>
+      </div>
+      <div class="mod-modal-foot">
+        <div class="mod-vote" id="modm-vote">
+          <button class="vote-btn" id="modm-like" title="Нравится">👍 <span id="modm-likes">0</span></button>
+          <button class="vote-btn" id="modm-dislike" title="Не нравится">👎 <span id="modm-dislikes">0</span></button>
+        </div>
+        <span class="hint" id="modm-hint"></span>
+        <button id="modm-install" class="btn-accent">⬇ Скачать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Модалка «Сборка модов»: свой код + применение чужого ══ -->
+  <div class="overlay" id="build-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-title">Сборка модов</span>
+        <button id="build-close" class="winbtn">✕</button>
+      </div>
+      <p class="mig-sub">Код — это твой набор модов одной строкой. Кинь его другу, и у него соберётся то же самое.</p>
+
+      <div class="modal-block">
+        <span class="label">Твой код сборки</span>
+        <div class="row-inline">
+          <input id="build-code" type="text" readonly placeholder="нажми «Создать код»" />
+          <button id="build-make" class="btn-secondary">Создать код</button>
+          <button id="build-copy" class="btn-secondary" hidden>Копировать</button>
+        </div>
+        <span class="hint" id="build-share-hint"></span>
+      </div>
+
+      <div class="modal-divider"><span>или</span></div>
+
+      <div class="modal-block">
+        <span class="label">Применить чужой код</span>
+        <div class="row-inline">
+          <input id="build-input" type="text" maxlength="12" placeholder="Например, K7M2QP" spellcheck="false" />
+          <button id="build-apply" class="btn-accent">Применить</button>
+        </div>
+        <span class="hint">Доставим недостающие моды. Твои моды не удалятся.</span>
+        <div class="migrate-results" id="build-results" hidden></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ══ Модалка переноса из другого лаунчера ══ -->
   <div class="overlay" id="migrate-overlay" hidden>
     <div class="modal modal-wide">
       <div class="modal-head">
-        <span class="modal-title">📦 Перенос из другого лаунчера</span>
+        <span class="modal-title">Перенос из другого лаунчера</span>
         <button id="migrate-close" class="winbtn">✕</button>
       </div>
       <p class="mig-sub">Заберём твои настройки, миры и паки — играть будет как дома.</p>
@@ -183,7 +267,7 @@
         <span class="label">Откуда переносить</span>
         <div class="row-inline">
           <select id="migrate-source"></select>
-          <button id="migrate-browse" class="btn-secondary">📁 Обзор…</button>
+          <button id="migrate-browse" class="btn-secondary">Обзор…</button>
         </div>
         <div class="mig-found" id="migrate-source-hint"></div>
       </div>
