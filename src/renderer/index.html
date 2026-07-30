@@ -231,6 +231,19 @@
       <p class="mig-sub">Код — это твой набор модов одной строкой. Кинь его другу, и у него соберётся то же самое.</p>
 
       <div class="modal-block">
+        <span class="label">Что положить в код</span>
+        <div class="share-parts">
+          <label class="checkbox"><input id="share-configs" type="checkbox" checked />
+            <span>Настройки модов <i>зум, миникарта, оптимизация</i></span></label>
+          <label class="checkbox"><input id="share-options" type="checkbox" checked />
+            <span>Управление и графика <i>клавиши, видео, звук</i></span></label>
+          <label class="checkbox"><input id="share-shaders" type="checkbox" checked />
+            <span>Настройки шейдеров</span></label>
+        </div>
+        <span class="hint">Моды и паки входят всегда. Карта и вейпоинты не передаются — это координаты твоих баз.</span>
+      </div>
+
+      <div class="modal-block">
         <span class="label">Твой код сборки</span>
         <div class="row-inline">
           <input id="build-code" type="text" readonly placeholder="нажми «Создать код»" />
@@ -248,7 +261,15 @@
           <input id="build-input" type="text" maxlength="12" placeholder="Например, K7M2QP" spellcheck="false" />
           <button id="build-apply" class="btn-accent">Применить</button>
         </div>
-        <span class="hint">Доставим недостающие моды. Твои моды не удалятся.</span>
+        <span class="hint" id="build-apply-hint">Доставим недостающие моды. Твои моды не удалятся.</span>
+        <div class="share-parts" id="apply-parts" hidden>
+          <label class="checkbox"><input id="apply-configs" type="checkbox" checked />
+            <span>Настройки модов</span></label>
+          <label class="checkbox"><input id="apply-options" type="checkbox" checked />
+            <span>Управление и графика <i>заменит твои клавиши</i></span></label>
+          <label class="checkbox"><input id="apply-shaders" type="checkbox" checked />
+            <span>Настройки шейдеров</span></label>
+        </div>
         <div class="migrate-results" id="build-results" hidden></div>
       </div>
     </div>

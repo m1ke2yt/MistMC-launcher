@@ -377,7 +377,13 @@ async function runTask(label, taskObj) {
 // ─── IPC ──────────────────────────────────────────────────────────────
 ipcMain.handle('get-config', () => {
   const config = loadConfig();
-  return { config, versionInfo: VERSION_INFO, account: resolveAccount(config) };
+  // версию лаунчера отдаём отсюда, а не из VERSION_INFO: getVersion() доступен
+  // только после инициализации app, а модуль читается раньше
+  return {
+    config,
+    versionInfo: { ...VERSION_INFO, launcher: app.getVersion() },
+    account: resolveAccount(config),
+  };
 });
 // Renderer шлёт только игровые настройки — мержим по белому списку, иначе
 // каждое сохранение затирало бы аккаунт (accountType/offlineName/msAccount).
@@ -587,26 +593,55 @@ ipcMain.handle('community-vote', async (_e, { project, value }) => {
 ipcMain.handle('community-ratings', (_e, { ids }) => community.ratings(ids, currentNick()));
 ipcMain.handle('community-top', (_e, { type }) => community.top(type, 25));
 
-ipcMain.handle('build-share', async (_e, { loader }) => {
+ipcMain.handle('build-share', async (_e, { loader, parts }) => {
   const nick = currentNick();
   if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
-  const build = mods.exportBuild(currentGameDir(), loader || 'fabric');
-  if (!build.items.length) {
+  let build;
+  try {
+    build = mods.exportBuild(currentGameDir(), loader || 'fabric', parts);
+  } catch (e) {
+    return { ok: false, error: e.message }; // например, настройки не влезли
+  }
+  if (!build.items.length && !build.filesGz) {
     return { ok: false, error: 'Сборка пустая — поставь хотя бы один мод' };
   }
-  return community.shareBuild(nick, build);
+  const res = await community.shareBuild(nick, build);
+  return res.ok ? { ...res, filesInfo: build.filesInfo || null } : res;
 });
 
-ipcMain.handle('build-apply', async (_e, { code }) => {
+// Код смотрим ДО установки: получатель должен видеть, что в нём лежит, и сам
+// решить, брать ли чужие настройки. Ответ держим в памяти, чтобы установка
+// не дёргала сайт повторно (и не накручивала счётчик применений).
+let pendingBuild = null;
+const normCode = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+ipcMain.handle('build-preview', async (_e, { code }) => {
   const res = await community.fetchBuild(code);
   if (!res.ok) return res;
+  pendingBuild = { code: normCode(res.code), author: res.author, build: res.build };
+  return {
+    ok: true,
+    code: res.code,
+    author: res.author,
+    items: (res.build && Array.isArray(res.build.items) ? res.build.items.length : 0),
+    filesInfo: (res.build && res.build.filesInfo) || null,
+  };
+});
+
+ipcMain.handle('build-apply', async (_e, { code, parts }) => {
+  let data = pendingBuild && pendingBuild.code === normCode(code) ? pendingBuild : null;
+  if (!data) {
+    const res = await community.fetchBuild(code);
+    if (!res.ok) return res;
+    data = { code: normCode(res.code), author: res.author, build: res.build };
+  }
   try {
     status('Применяю сборку…');
     send('state', { state: 'working' });
-    const summary = await mods.applyBuild(currentGameDir(), res.build, MC_VERSION, logLine);
+    const summary = await mods.applyBuild(currentGameDir(), data.build, MC_VERSION, logLine, parts);
     send('state', { state: 'idle' });
     status('Сборка применена');
-    return { ok: true, author: res.author, summary };
+    return { ok: true, author: data.author, summary };
   } catch (e) {
     send('state', { state: 'idle' });
     return { ok: false, error: e.message };

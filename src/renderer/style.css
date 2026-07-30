@@ -284,6 +284,12 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .segm.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff;
   border-color: transparent; box-shadow: 0 3px 12px var(--accent-glow); }
 
+/* Галочки «что положить в код» / «что взять из кода» */
+.share-parts { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+.share-parts .checkbox { font-size: 12px; align-items: flex-start; }
+.share-parts .checkbox input { margin-top: 1px; }
+.share-parts i { display: block; font-style: normal; font-size: 10px; color: #8a78ad; }
+
 /* Код сборки — главное содержимое своей модалки, поэтому крупно и вразрядку */
 #build-code {
   font-size: 17px; font-weight: 800; letter-spacing: 4px; text-align: center;

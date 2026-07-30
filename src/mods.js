@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const { fetch, Agent } = require('undici');
 
 const API = 'https://api.modrinth.com/v2';
@@ -843,12 +844,100 @@ function syncMods(gameDir, loader, bundledDir, log) {
 }
 
 // ── сборка игрока: экспорт кодом и применение ───────────────────────────
+// ── настройки внутри кода сборки ────────────────────────────────────────
+// Кроме списка модов код может нести НЕЛИЧНЫЕ настройки: config/ (параметры
+// модов), options.txt (управление, графика, звук) и настройки шейдеров.
+// Карту и вейпоинты не переносим НИКОГДА и ни под какой галочкой: это
+// координаты баз игрока, и делиться ими «заодно с модами» он не подписывался.
+const SHARE_MAX_FILE = 256 * 1024;      // один файл
+const SHARE_MAX_RAW = 3 * 1024 * 1024;  // всё вместе до сжатия
+const SHARE_MAX_PACKED = 500 * 1024;    // после сжатия (лимит сайта — 700 КБ)
+const SHARE_EXT = new Set(['.json', '.json5', '.toml', '.cfg', '.conf', '.properties',
+  '.txt', '.yaml', '.yml', '.ini', '.snbt', '.xml']);
+// мусор и кэши: возить туда-сюда незачем (у Plasmo Voice, например, в config
+// лежат переводы на два десятка языков)
+const SHARE_SKIP_DIRS = new Set(['cache', 'caches', 'logs', 'backup', 'backups', 'temp', 'tmp']);
+
+/** Категория файла для галочек; null — файл в код сборки не допускается. */
+function shareCategory(relPath) {
+  const p = String(relPath || '').replace(/\\/g, '/');
+  // защита от чужого кода: никаких выходов вверх и абсолютных путей
+  if (!p || p.includes('..') || p.startsWith('/') || /^[A-Za-z]:/.test(p)) return null;
+  if (p === 'options.txt') return 'options';
+  if (/^shaderpacks\/[^/]+\.txt$/.test(p)) return 'shaders';
+  if (p.startsWith('config/') && SHARE_EXT.has(path.extname(p).toLowerCase())) return 'configs';
+  return null;
+}
+
+function walkConfigDir(dir, base, out, state, depth = 0) {
+  if (depth > 4 || state.bytes > SHARE_MAX_RAW) return;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue; // .crowdin и подобное — не настройки
+    const full = path.join(dir, e.name);
+    const rel = path.posix.join(base, e.name);
+    if (e.isDirectory()) {
+      if (SHARE_SKIP_DIRS.has(e.name.toLowerCase())) continue;
+      walkConfigDir(full, rel, out, state, depth + 1);
+    } else if (e.isFile()) {
+      if (!SHARE_EXT.has(path.extname(e.name).toLowerCase())) continue;
+      let st;
+      try { st = fs.statSync(full); } catch (_) { continue; }
+      if (st.size > SHARE_MAX_FILE || state.bytes + st.size > SHARE_MAX_RAW) continue;
+      try {
+        out[rel] = fs.readFileSync(full, 'utf8');
+        state.bytes += st.size;
+      } catch (_) { /* нечитаемый файл пропускаем */ }
+    }
+  }
+}
+
+/** Собрать выбранные настройки: { map: {путь: содержимое}, info } */
+function collectShareFiles(gameDir, parts) {
+  const map = {};
+  const state = { bytes: 0 };
+  const info = { configs: 0, options: false, shaders: 0, bytes: 0 };
+  if (parts && parts.configs) {
+    walkConfigDir(path.join(gameDir, 'config'), 'config', map, state);
+    info.configs = Object.keys(map).length;
+  }
+  if (parts && parts.options) {
+    const p = path.join(gameDir, 'options.txt');
+    try {
+      const st = fs.statSync(p);
+      if (st.size <= SHARE_MAX_FILE) {
+        map['options.txt'] = fs.readFileSync(p, 'utf8');
+        state.bytes += st.size;
+        info.options = true;
+      }
+    } catch (_) { /* нет файла — нечего переносить */ }
+  }
+  if (parts && parts.shaders) {
+    const dir = path.join(gameDir, 'shaderpacks');
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.toLowerCase().endsWith('.txt')) continue; // настройки, а не сами паки
+        const p = path.join(dir, f);
+        const st = fs.statSync(p);
+        if (!st.isFile() || st.size > SHARE_MAX_FILE) continue;
+        map[path.posix.join('shaderpacks', f)] = fs.readFileSync(p, 'utf8');
+        state.bytes += st.size;
+        info.shaders++;
+      }
+    } catch (_) { /* нет шейдеров */ }
+  }
+  info.bytes = state.bytes;
+  return { map, info };
+}
+
 /**
  * Что игрок поставил САМ (вшитые моды Mist MC не включаем — они и так есть
  * у каждого). Версии сохраняем поимённо: смысл кода сборки в том, чтобы у
  * друга собралось ровно то же, а не «примерно похожее».
+ * parts — какие настройки приложить (configs/options/shaders).
  */
-function exportBuild(gameDir, loader) {
+function exportBuild(gameDir, loader, parts) {
   const m = readManifest(gameDir);
   const items = m.user
     .filter((e) => !e.pendingRemove && (e.type !== 'mod' || e.loader === loader))
@@ -862,7 +951,21 @@ function exportBuild(gameDir, loader) {
       versionNumber: e.versionNumber || '',
       enabled: e.enabled !== false,
     }));
-  return { loader, items, bundledDisabled: m.bundledDisabled || [] };
+  const build = { loader, items, bundledDisabled: m.bundledDisabled || [] };
+
+  if (parts && (parts.configs || parts.options || parts.shaders)) {
+    const { map, info } = collectShareFiles(gameDir, parts);
+    if (Object.keys(map).length) {
+      const packed = zlib.gzipSync(Buffer.from(JSON.stringify(map), 'utf8'), { level: 9 });
+      if (packed.length > SHARE_MAX_PACKED) {
+        throw new Error('настройки слишком большие ('
+          + Math.round(packed.length / 1024) + ' КБ) — сними часть галочек');
+      }
+      build.filesGz = packed.toString('base64');
+      build.filesInfo = info; // что внутри — получатель видит ДО установки
+    }
+  }
+  return build;
 }
 
 /**
@@ -870,10 +973,52 @@ function exportBuild(gameDir, loader) {
  * ничего не удаляем — игрок делится сборкой, а не стирает чужие моды.
  * Возвращает сводку для UI.
  */
-async function applyBuild(gameDir, build, mcVersion, log) {
+/**
+ * Разложить настройки из чужого кода. Пути проверяем по белому списку категорий
+ * (чужой код — недоверенные данные, иначе им можно было бы писать куда угодно),
+ * а всё, что заменяем, сперва кладём рядом с пометкой .bak-build, чтобы игрок
+ * мог вернуть своё управление.
+ */
+function applyShareFiles(gameDir, build, parts, log) {
+  const res = { written: 0, skipped: 0, backedUp: 0 };
+  if (!build || !build.filesGz) return res;
+  let map;
+  try {
+    map = JSON.parse(zlib.gunzipSync(Buffer.from(build.filesGz, 'base64')).toString('utf8'));
+  } catch (e) {
+    log('  ! настройки в коде повреждены: ' + e.message);
+    return res;
+  }
+  for (const [rel, content] of Object.entries(map)) {
+    const cat = shareCategory(rel);
+    if (!cat || !parts || !parts[cat] || typeof content !== 'string') { res.skipped++; continue; }
+    const dest = path.join(gameDir, rel.replace(/\//g, path.sep));
+    // финальная страховка: результат обязан остаться внутри папки игры
+    if (!path.resolve(dest).startsWith(path.resolve(gameDir) + path.sep)) { res.skipped++; continue; }
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      if (fs.existsSync(dest)) {
+        const bak = dest + '.bak-build';
+        if (!fs.existsSync(bak)) { fs.copyFileSync(dest, bak); res.backedUp++; }
+      }
+      fs.writeFileSync(dest, content, 'utf8');
+      res.written++;
+    } catch (e) {
+      log('  ! ' + rel + ': ' + e.message);
+      res.skipped++;
+    }
+  }
+  if (res.written) {
+    log('  ⚙ настроек применено: ' + res.written
+      + (res.backedUp ? ' (прежние сохранены как *.bak-build: ' + res.backedUp + ')' : ''));
+  }
+  return res;
+}
+
+async function applyBuild(gameDir, build, mcVersion, log, parts) {
   const loader = build && build.loader === 'forge' ? 'forge' : 'fabric';
   const items = Array.isArray(build && build.items) ? build.items : [];
-  const summary = { installed: [], already: [], failed: [], loader };
+  const summary = { installed: [], already: [], failed: [], loader, files: null };
   for (const it of items) {
     if (!it || !it.projectId) continue;
     const type = TYPES[it.type] ? it.type : 'mod';
@@ -893,6 +1038,10 @@ async function applyBuild(gameDir, build, mcVersion, log) {
   try {
     await enforceJarDeps(gameDir, loader, mcVersion, log);
   } catch (_) { /* сеть — играем как есть */ }
+  // настройки кладём ПОСЛЕ модов: конфиг без своего мода бесполезен
+  if (build && build.filesGz && parts) {
+    summary.files = applyShareFiles(gameDir, build, parts, log);
+  }
   return summary;
 }
 

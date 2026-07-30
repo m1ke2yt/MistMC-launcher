@@ -9,7 +9,7 @@ if (!window.api) {
   window.api = {
     getConfig: async () => ({
       config: { ram: 4096, loader: 'fabric', joinServer: true, gameDir: 'C:\\…\\.mistmc' },
-      versionInfo: { mc: '1.21.11', fabric: '0.19.3', forge: '61.1.0' },
+      versionInfo: { mc: '1.21.11', fabric: '0.19.3', forge: '61.1.0', launcher: '1.5.1' },
       account: null,
     }),
     saveConfig: async () => true,
@@ -33,7 +33,10 @@ if (!window.api) {
     communityVote: async () => ({ ok: true, rating: { likes: 1, dislikes: 0, mine: 1 } }),
     communityRatings: async () => ({ ok: true, ratings: [] }),
     communityTop: async () => ({ ok: true, top: [] }),
-    buildShare: async () => ({ ok: true, code: 'K7M2QP', reused: false }),
+    buildShare: async () => ({ ok: true, code: 'K7M2QP', reused: false,
+      filesInfo: { configs: 12, options: true, shaders: 1, bytes: 40000 } }),
+    buildPreview: async () => ({ ok: true, code: 'K7M2QP', author: 'M1ke2', items: 5,
+      filesInfo: { configs: 12, options: true, shaders: 1, bytes: 40000 } }),
     buildApply: async () => ({ ok: false, error: 'предпросмотр' }),
     modDetails: async () => ({
       ok: true,
@@ -991,7 +994,8 @@ async function init() {
   state.loader = config.loader || 'fabric';
   state.account = account || null;
   els.mcVer.textContent = versionInfo.mc;
-  els.verLine.textContent = 'Fabric ' + versionInfo.fabric + ' / Forge ' + versionInfo.forge;
+  els.verLine.textContent = (versionInfo.launcher ? 'v' + versionInfo.launcher + ' · ' : '')
+    + 'Fabric ' + versionInfo.fabric + ' / Forge ' + versionInfo.forge;
 
   for (const btn of els.loader.querySelectorAll('.seg')) {
     btn.classList.toggle('active', btn.dataset.val === state.loader);
@@ -1179,6 +1183,10 @@ init();
     codeInput.value = '';
     makeBtn.hidden = false;
     copyBtn.hidden = true;
+    previewed = null;
+    $('apply-parts').hidden = true;
+    applyBtn.textContent = 'Применить';
+    $('build-apply-hint').textContent = 'Доставим недостающие моды. Твои моды не удалятся.';
     openOverlay(overlay);
     if (focusApply) setTimeout(() => applyInput.focus(), 40);
   }
@@ -1188,10 +1196,31 @@ init();
   $('build-close').addEventListener('click', () => closeOverlay(overlay));
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeOverlay(overlay); });
 
+  const shareParts = () => ({
+    configs: $('share-configs').checked,
+    options: $('share-options').checked,
+    shaders: $('share-shaders').checked,
+  });
+  const applyParts = () => ({
+    configs: $('apply-configs').checked,
+    options: $('apply-options').checked,
+    shaders: $('apply-shaders').checked,
+  });
+
+  /** «5 модов · настройки модов (12) · управление» — что лежит в коде. */
+  function describeBuild(items, info) {
+    const parts = [];
+    if (items) parts.push(items + ' ' + (items === 1 ? 'позиция' : items < 5 ? 'позиции' : 'позиций'));
+    if (info && info.configs) parts.push('настройки модов (' + info.configs + ')');
+    if (info && info.options) parts.push('управление и графика');
+    if (info && info.shaders) parts.push('настройки шейдеров (' + info.shaders + ')');
+    return parts.join(' · ') || 'пусто';
+  }
+
   makeBtn.addEventListener('click', async () => {
     makeBtn.disabled = true;
     makeBtn.textContent = 'Создаю…';
-    const res = await window.api.buildShare(state.loader);
+    const res = await window.api.buildShare(state.loader, shareParts());
     makeBtn.disabled = false;
     makeBtn.textContent = 'Создать код';
     if (res && res.ok) {
@@ -1200,9 +1229,12 @@ init();
       // не помещались и кнопку выдавливало за край модалки
       makeBtn.hidden = true;
       copyBtn.hidden = false;
-      shareHint.textContent = res.reused
+      const what = res.filesInfo
+        ? ' В коде: ' + describeBuild(0, res.filesInfo).replace(/^ · /, '') + '.'
+        : '';
+      shareHint.textContent = (res.reused
         ? 'Этот код уже был создан для такой же сборки — им и делись.'
-        : 'Готово! Отправь код друзьям — у них соберётся то же самое.';
+        : 'Готово! Отправь код друзьям — у них соберётся то же самое.') + what;
     } else {
       codeInput.value = '';
       makeBtn.hidden = false;
@@ -1222,16 +1254,58 @@ init();
     }
   });
 
+  // Если в коде есть чужие настройки, сперва показываем что там и даём галочки:
+  // молча заменять человеку раскладку клавиш нельзя.
+  let previewed = null; // код, который уже показали
+  const partsBox = $('apply-parts');
+  const applyHint = $('build-apply-hint');
+
+  applyInput.addEventListener('input', () => {
+    if (previewed && previewed !== applyInput.value.trim().toUpperCase()) {
+      previewed = null;
+      partsBox.hidden = true;
+      applyBtn.textContent = 'Применить';
+      applyHint.textContent = 'Доставим недостающие моды. Твои моды не удалятся.';
+    }
+  });
+
   applyBtn.addEventListener('click', async () => {
     const code = applyInput.value.trim();
     if (!code) { applyInput.focus(); return; }
+
+    if (previewed !== code.toUpperCase()) {
+      applyBtn.disabled = true;
+      applyBtn.textContent = 'Смотрю…';
+      const pv = await window.api.buildPreview(code);
+      applyBtn.disabled = false;
+      applyBtn.textContent = 'Применить';
+      if (!pv || !pv.ok) {
+        resultsBox.hidden = false;
+        resultsBox.textContent = '✖ ' + ((pv && pv.error) || 'код не найден');
+        return;
+      }
+      previewed = code.toUpperCase();
+      applyHint.textContent = 'Сборка игрока ' + pv.author + ': ' + describeBuild(pv.items, pv.filesInfo);
+      if (pv.filesInfo) {
+        // показываем только те галочки, что реально есть в коде
+        partsBox.hidden = false;
+        $('apply-configs').closest('.checkbox').hidden = !pv.filesInfo.configs;
+        $('apply-options').closest('.checkbox').hidden = !pv.filesInfo.options;
+        $('apply-shaders').closest('.checkbox').hidden = !pv.filesInfo.shaders;
+        applyBtn.textContent = 'Установить';
+        return; // второй клик — установка
+      }
+    }
+
     applyBtn.disabled = true;
     applyBtn.textContent = 'Применяю…';
     resultsBox.hidden = false;
     resultsBox.textContent = 'Скачиваю моды сборки…';
-    const res = await window.api.buildApply(code);
+    const res = await window.api.buildApply(code, applyParts());
     applyBtn.disabled = false;
     applyBtn.textContent = 'Применить';
+    previewed = null;
+    partsBox.hidden = true;
     if (!res || !res.ok) {
       resultsBox.textContent = '✖ ' + ((res && res.error) || 'не удалось применить код');
       return;
@@ -1241,7 +1315,13 @@ init();
     if (s.installed?.length) lines.push('✓ поставлено: ' + s.installed.join(', '));
     if (s.already?.length) lines.push('• уже было: ' + s.already.join(', '));
     if (s.failed?.length) lines.push('✖ не вышло: ' + s.failed.join('; '));
-    if (!s.installed?.length && !s.already?.length) lines.push('в сборке нечего ставить');
+    if (s.files?.written) {
+      lines.push('⚙ настроек применено: ' + s.files.written
+        + (s.files.backedUp ? ' (прежние сохранены как *.bak-build)' : ''));
+    }
+    if (!s.installed?.length && !s.already?.length && !s.files?.written) {
+      lines.push('в сборке нечего ставить');
+    }
     resultsBox.textContent = lines.join('\n');
     refreshModsView();
   });
