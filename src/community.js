@@ -89,4 +89,66 @@ function fetchBuild(code) {
   return call('/api/bridge/launcher/share?code=' + encodeURIComponent(String(code || '').trim()));
 }
 
-module.exports = { init, vote, ratings, top, shareBuild, fetchBuild };
+/** Каталог косметики + что куплено/надето + баланс искр. */
+function cosmetics(nick) {
+  return call('/api/bridge/launcher/cosmetics?nick=' + encodeURIComponent(nick || ''));
+}
+
+/** action: 'buy' | 'equip'; id = null снимает надетое. */
+function cosmeticAction(nick, action, id, slot) {
+  const body = signBody(
+    { nick, action, id, slot },
+    (ts) => `${nick}|${action}|${id ?? ''}|${ts}`,
+  );
+  return call('/api/bridge/launcher/cosmetics', { method: 'POST', body });
+}
+
+/** Свои рисованные плащи и флаги: что одобрено, что на проверке, что завернули. */
+function drawings(nick) {
+  return call('/api/bridge/launcher/cape?nick=' + encodeURIComponent(nick || ''));
+}
+
+/** Отправить рисунок на модерацию. png — base64 без префикса data:. */
+function submitDrawing(nick, kind, png) {
+  const body = signBody({ nick, kind, png }, (ts) => `${nick}|cape|${kind}|${ts}`);
+  return call('/api/bridge/launcher/cape', { method: 'POST', body });
+}
+
+/** Какой скин стоит у игрока на сайте: url на PNG (с суммой — кэш сам
+ *  обновится при смене) или null, если скин обычный. */
+async function skinState(nick) {
+  const res = await call('/api/bridge/launcher/skin?nick=' + encodeURIComponent(nick));
+  if (!res || !res.ok || !res.skin || !res.skin.sha1) return { ok: true, url: null };
+  return {
+    ok: true,
+    url: `${SITE}/api/bridge/launcher/skin?nick=${encodeURIComponent(nick)}&png=1&v=${res.skin.sha1}`,
+    slim: !!res.skin.slim,
+  };
+}
+
+/** Поставить свой скин (png — base64 без префикса data:). */
+function applySkin(nick, png, slim) {
+  const body = signBody({ nick, png, slim }, (ts) => `${nick}|skin|set|${ts}`);
+  return call('/api/bridge/launcher/skin', { method: 'POST', body });
+}
+
+/** Вернуть обычный скин аккаунта. */
+function resetSkin(nick) {
+  const body = signBody({ nick, reset: true }, (ts) => `${nick}|skin|reset|${ts}`);
+  return call('/api/bridge/launcher/skin', { method: 'POST', body });
+}
+
+/** Опись косметик-пака: что положить в локальный ресурспак игрока. */
+function cosmeticPack(nick) {
+  return call('/api/bridge/launcher/cosmetic-pack?nick=' + encodeURIComponent(nick || ''));
+}
+
+/** Адрес сайта — нужен модулю сборки пака, чтобы качать текстуры. */
+function siteUrl() {
+  return SITE;
+}
+
+module.exports = {
+  init, vote, ratings, top, shareBuild, fetchBuild, cosmetics, cosmeticAction,
+  drawings, submitDrawing, cosmeticPack, siteUrl, applySkin, resetSkin, skinState,
+};

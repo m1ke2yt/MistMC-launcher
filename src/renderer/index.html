@@ -3,11 +3,84 @@
 <head>
   <meta charset="UTF-8" />
   <!-- img-src https: — скриншоты и картинки описаний модов живут не только на cdn.modrinth.com (github/imgur и т.п.) -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;" />
+  <!-- mistbg: — свой протокол для фона окна (картинка/видео из папки настроек) -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: mistbg:; media-src 'self' mistbg:;" />
   <title>Mist MC Launcher</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- Фон окна: видео лежит слоем НАД фоном body, но под интерфейсом -->
+  <div id="bg-media" hidden>
+    <img id="bg-img" alt="" hidden />
+    <video id="bg-video" autoplay loop muted playsinline hidden></video>
+    <span id="bg-veil"></span>
+  </div>
+
+  <!-- Иконки: один спрайт, вставляются через <svg class="ic"><use href="#ic-…"/></svg> -->
+  <svg class="icon-sprite" aria-hidden="true">
+    <symbol id="ic-gear" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3.2"/>
+      <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/>
+    </symbol>
+    <symbol id="ic-like" viewBox="0 0 24 24">
+      <path d="M7 22V11l5-9a2.5 2.5 0 0 1 2.4 3.2L13.5 9H19a2.5 2.5 0 0 1 2.4 3.1l-1.6 7A2.5 2.5 0 0 1 17.4 21H7z"/>
+      <rect x="2.5" y="11" width="4.5" height="11" rx="1.2"/>
+    </symbol>
+    <symbol id="ic-dislike" viewBox="0 0 24 24">
+      <path d="M17 2v11l-5 9a2.5 2.5 0 0 1-2.4-3.2l.9-3.8H5a2.5 2.5 0 0 1-2.4-3.1l1.6-7A2.5 2.5 0 0 1 6.6 3H17z"/>
+      <rect x="17" y="2" width="4.5" height="11" rx="1.2"/>
+    </symbol>
+    <symbol id="ic-puzzle" viewBox="0 0 24 24">
+      <path d="M10 3.5a2 2 0 1 1 4 0V5h3.5A1.5 1.5 0 0 1 19 6.5V10h1.5a2 2 0 1 1 0 4H19v3.5a1.5 1.5 0 0 1-1.5 1.5H14v-1.5a2 2 0 1 0-4 0V19H6.5A1.5 1.5 0 0 1 5 17.5V14H3.5a2 2 0 1 1 0-4H5V6.5A1.5 1.5 0 0 1 6.5 5H10z"/>
+    </symbol>
+    <symbol id="ic-sliders" viewBox="0 0 24 24">
+      <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/>
+      <path d="M1 14h6M9 8h6M17 16h6"/>
+    </symbol>
+    <symbol id="ic-globe" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/>
+    </symbol>
+    <symbol id="ic-palette" viewBox="0 0 24 24">
+      <path d="M12 21a9 9 0 1 1 9-9c0 2-1.6 3-3 3h-1.5a2 2 0 0 0-1.4 3.4A1.8 1.8 0 0 1 12 21z"/>
+      <circle cx="7.5" cy="12" r="1"/><circle cx="10" cy="8" r="1"/><circle cx="15" cy="8.5" r="1"/>
+    </symbol>
+    <symbol id="ic-sparkle" viewBox="0 0 24 24">
+      <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>
+      <path d="M18.5 15.5l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z"/>
+    </symbol>
+    <symbol id="ic-map" viewBox="0 0 24 24">
+      <path d="M9 3.5 3 6v14.5l6-2.5 6 2.5 6-2.5V3.5l-6 2.5z"/><path d="M9 3.5v14.5M15 6v14.5"/>
+    </symbol>
+    <symbol id="ic-pin" viewBox="0 0 24 24">
+      <path d="M12 21s7-5.7 7-11a7 7 0 1 0-14 0c0 5.3 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/>
+    </symbol>
+    <symbol id="ic-image" viewBox="0 0 24 24">
+      <rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.8"/>
+      <path d="M21 16l-5-5-9 9"/>
+    </symbol>
+    <symbol id="ic-reset" viewBox="0 0 24 24">
+      <path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>
+    </symbol>
+    <symbol id="ic-edit" viewBox="0 0 24 24">
+      <path d="M4 20h4l10-10a2.8 2.8 0 1 0-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/>
+    </symbol>
+    <symbol id="ic-bucket" viewBox="0 0 24 24">
+      <path d="M5 12l7-7 7 7-7 7-7-7z"/><path d="M19 14c1.3 1.8 2 3 2 4a2 2 0 1 1-4 0c0-1 .7-2.2 2-4z"/>
+    </symbol>
+    <symbol id="ic-pipette" viewBox="0 0 24 24">
+      <path d="M4 20l1-4 8-8 3 3-8 8-4 1z"/><path d="M14 5l2-2a2.2 2.2 0 0 1 3 3l-2 2z"/>
+    </symbol>
+    <symbol id="ic-eraser" viewBox="0 0 24 24">
+      <path d="M8 20h11"/><path d="M15 5l5 5-8 8H7l-3-3 11-10z"/>
+    </symbol>
+    <symbol id="ic-undo" viewBox="0 0 24 24">
+      <path d="M9 8H5V4"/><path d="M5 8a8 8 0 1 1-1 6"/>
+    </symbol>
+    <symbol id="ic-trash" viewBox="0 0 24 24">
+      <path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/>
+    </symbol>
+  </svg>
+
   <div class="titlebar">
     <div class="titlebar-drag">
       <span class="logo">✦ MIST MC</span>
@@ -16,6 +89,9 @@
     <nav class="tabs" id="tabs">
       <button class="tab active" data-tab="game">Игра</button>
       <button class="tab" data-tab="mods">Моды</button>
+      <!-- Косметика временно скрыта: снять hidden здесь и COSMETICS_ENABLED=true
+           в renderer.js, чтобы вернуть вкладку -->
+      <button class="tab" data-tab="cosmetics">Косметика</button>
     </nav>
     <div class="titlebar-right">
       <!-- Аккаунт в шапке: кнопка входа исчезает после входа, вместо неё чип -->
@@ -34,6 +110,9 @@
         <button id="menu-logout" class="acc-menu-item acc-menu-danger">Выйти</button>
       </div>
       <div class="titlebar-controls">
+        <button id="btn-settings" class="winbtn" title="Настройки лаунчера">
+          <svg class="ic"><use href="#ic-gear"/></svg>
+        </button>
         <button id="btn-min" class="winbtn" title="Свернуть">—</button>
         <button id="btn-close" class="winbtn winbtn-close" title="Закрыть">✕</button>
       </div>
@@ -151,9 +230,61 @@
     </div>
 
     <div class="mods-vanilla" id="mods-vanilla" hidden>
-      <div class="mods-vanilla-icon">🧩</div>
+      <div class="mods-vanilla-icon"><svg class="ic"><use href="#ic-puzzle"/></svg></div>
       <p>Моды работают на <b>Fabric</b> или <b>Forge</b>.</p>
       <p class="hint">Выбери сборку на вкладке «Игра», и здесь появится каталог модов.</p>
+    </div>
+  </main>
+
+  <!-- ══ Вкладка «Косметика» ══ -->
+  <main id="view-cosmetics" hidden>
+    <div class="cosm-head">
+      <div class="wallet">
+        <span class="wallet-label">Искры</span>
+        <span class="wallet-value" id="wallet-balance">—</span>
+      </div>
+      <span class="hint" id="cosm-hint">Искры капают за вход в игру через лаунчер: раз в сутки, больше за серию дней.</span>
+    </div>
+    <div class="content-types" id="cosm-types">
+      <button class="ctype active" data-slot="">Всё</button>
+      <button class="ctype" data-slot="hat">Голова</button>
+      <button class="ctype" data-slot="back">Спина</button>
+      <button class="ctype" data-slot="cape">Плащ</button>
+      <button class="ctype" data-slot="hand">В руке</button>
+      <button class="ctype" data-slot="balloon">Шарик</button>
+      <button class="ctype" data-slot="skin">Скин</button>
+    </div>
+    <div class="cosm-layout">
+      <!-- Примерочная: вещь показываем на самом игроке, его же скином.
+           Витрина без этого — набор подписей, по ним не выбрать. -->
+      <div class="cosm-fitting">
+        <canvas id="cosm-view" class="cosm-view"></canvas>
+        <div class="cosm-view-name" id="cosm-view-name">Выбери вещь</div>
+        <div class="cosm-view-hint" id="cosm-view-hint">Крути мышью</div>
+      </div>
+      <div class="cosm-scroll" id="cosm-scroll">
+        <div class="cosm-grid" id="cosm-grid"></div>
+
+        <!-- Скин: ставится здесь же, потому что примерка одна и та же фигура -->
+        <div class="cosm-skin" id="cosm-skin" hidden>
+          <span class="label">Свой скин</span>
+          <p class="hint">
+            Обычный скин Minecraft, 64×64. Ставится на сервере — увидят все, даже те,
+            кто играет без лицензии.
+          </p>
+          <div class="rowActions draw-actions">
+            <button id="skin-pick" class="btn-secondary">Выбрать PNG</button>
+            <button id="skin-apply" class="btn-accent">Применить</button>
+          </div>
+          <input id="skin-file" type="file" accept="image/png" hidden />
+          <span class="hint" id="skin-hint"></span>
+          <div class="row-inline skin-model-row">
+            <label class="checkbox"><input id="skin-slim" type="checkbox" />
+              <span>Тонкие руки <i>модель Alex</i></span></label>
+          </div>
+          <button id="skin-reset" class="link">вернуть свой обычный скин</button>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -212,11 +343,95 @@
       </div>
       <div class="mod-modal-foot">
         <div class="mod-vote" id="modm-vote">
-          <button class="vote-btn" id="modm-like" title="Нравится">👍 <span id="modm-likes">0</span></button>
-          <button class="vote-btn" id="modm-dislike" title="Не нравится">👎 <span id="modm-dislikes">0</span></button>
+          <button class="vote-btn" id="modm-like" title="Нравится"><svg class="ic"><use href="#ic-like"/></svg> <span id="modm-likes">0</span></button>
+          <button class="vote-btn" id="modm-dislike" title="Не нравится"><svg class="ic"><use href="#ic-dislike"/></svg> <span id="modm-dislikes">0</span></button>
         </div>
         <span class="hint" id="modm-hint"></span>
         <button id="modm-install" class="btn-accent">⬇ Скачать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Модалка настроек лаунчера (шестерёнка) ══ -->
+  <div class="overlay" id="settings-overlay" hidden>
+    <div class="modal modal-settings">
+      <div class="modal-head">
+        <span class="modal-title">Настройки лаунчера</span>
+        <button id="settings-close" class="winbtn">✕</button>
+      </div>
+
+      <div class="settings-cols">
+        <div class="modal-block">
+          <span class="label">Цвет акцента</span>
+          <div class="swatches" id="accent-swatches"></div>
+          <div class="row-inline">
+            <input id="accent-picker" type="color" value="#a855f7" title="Свой цвет" />
+            <input id="accent-hex" type="text" maxlength="7" spellcheck="false" />
+          </div>
+          <span class="hint">Кнопки, вкладки, полоса загрузки.</span>
+        </div>
+
+        <div class="modal-block">
+          <span class="label">Цвет фона</span>
+          <div class="swatches" id="bg-swatches"></div>
+          <div class="row-inline">
+            <input id="bg-picker" type="color" value="#0f0518" title="Свой цвет" />
+            <input id="bg-hex" type="text" maxlength="7" spellcheck="false" />
+          </div>
+          <span class="hint">Подложка окна и карточек.</span>
+        </div>
+      </div>
+
+      <div class="modal-block">
+        <span class="label">Картинка на фон</span>
+        <div class="row-inline">
+          <button id="bg-image-pick" class="btn-secondary">
+            <svg class="ic"><use href="#ic-image"/></svg> Выбрать файл
+          </button>
+          <button id="bg-image-clear" class="btn-secondary" hidden>Убрать</button>
+        </div>
+        <div id="bg-adjust" hidden>
+          <div class="bg-preview" id="bg-preview">
+            <img id="bg-preview-img" alt="" hidden />
+            <video id="bg-preview-video" autoplay loop muted playsinline hidden></video>
+            <span class="bg-preview-hint">Тяни мышью, чтобы выбрать видимую часть</span>
+          </div>
+          <div class="bg-row">
+            <span class="label">Масштаб</span>
+            <input id="bg-scale" type="range" min="100" max="300" step="5" value="100" />
+            <span class="label"><b id="bg-scale-val">100</b>%</span>
+            <button id="bg-reset-crop" class="btn-secondary" title="Вернуть кадр в исходное положение">
+              <svg class="ic"><use href="#ic-reset"/></svg>
+            </button>
+          </div>
+          <div class="bg-row">
+            <span class="label">Насыщенность</span>
+            <input id="bg-opacity" type="range" min="5" max="100" step="5" value="45" />
+            <span class="label"><b id="bg-opacity-val">45</b>%</span>
+          </div>
+        </div>
+        <span class="hint" id="bg-image-hint">Картинка, гифка или видео (MP4, WEBM). Любого размера.</span>
+      </div>
+
+      <div class="modal-block">
+        <span class="label">Блоки интерфейса</span>
+        <div class="row">
+          <span class="label">Прозрачность всех</span>
+          <input id="blocks-opacity" type="range" min="20" max="100" step="5" value="100" />
+          <span class="label"><b id="blocks-opacity-val">100</b>%</span>
+        </div>
+        <div class="row">
+          <button id="blocks-edit" class="btn-secondary">Настроить блоки</button>
+          <button id="blocks-reset" class="btn-secondary">Сбросить блоки</button>
+        </div>
+        <span class="hint">В режиме настройки: тяни блок мышью (можно бросать — отскакивает от краёв),
+          колесо — прозрачность, Shift+колесо — размер. Esc или «Готово» — выйти.</span>
+      </div>
+
+      <div class="modal-block">
+        <button id="theme-reset" class="btn-secondary">
+          <svg class="ic"><use href="#ic-reset"/></svg> Вернуть стандартный вид
+        </button>
       </div>
     </div>
   </div>
@@ -275,6 +490,64 @@
     </div>
   </div>
 
+  <!-- ══ Модалка рисования плаща/флага ══ -->
+  <div class="overlay" id="draw-overlay" hidden>
+    <div class="modal modal-draw">
+      <div class="modal-head">
+        <span class="modal-title" id="draw-title">Свой плащ</span>
+        <button id="draw-close" class="winbtn">✕</button>
+      </div>
+      <p class="mig-sub" id="draw-sub">
+        Рисуешь сам. Готовое уходит модератору — как проверят, плащ увидят все на сервере.
+      </p>
+
+      <div class="draw-body">
+        <div class="draw-left">
+          <div class="content-types" id="draw-zones" style="display:none">
+            <button class="ctype active" data-zone="face">Плащ</button>
+            <button class="ctype" data-zone="elytra">Элитры</button>
+          </div>
+          <canvas id="draw-canvas" class="draw-canvas"></canvas>
+          <div class="draw-tools">
+            <button class="draw-tool is-on" data-tool="pen" title="Карандаш">
+              <svg class="ic"><use href="#ic-edit"/></svg></button>
+            <button class="draw-tool" data-tool="fill" title="Заливка области">
+              <svg class="ic"><use href="#ic-bucket"/></svg></button>
+            <button class="draw-tool" data-tool="pick" title="Пипетка">
+              <svg class="ic"><use href="#ic-pipette"/></svg></button>
+            <button class="draw-tool" data-tool="erase" title="Ластик">
+              <svg class="ic"><use href="#ic-eraser"/></svg></button>
+            <span class="draw-sep"></span>
+            <button id="draw-undo" class="draw-tool" title="Отменить (Ctrl+Z)">
+              <svg class="ic"><use href="#ic-undo"/></svg></button>
+            <button id="draw-clear" class="draw-tool" title="Очистить">
+              <svg class="ic"><use href="#ic-trash"/></svg></button>
+          </div>
+        </div>
+
+        <div class="draw-right">
+          <span class="label">Цвет</span>
+          <div class="draw-palette" id="draw-palette"></div>
+          <div class="row-inline draw-color-row">
+            <input id="draw-color" type="color" value="#a855f7" />
+            <span class="hint">свой оттенок</span>
+          </div>
+
+          <span class="label">Как это выглядит</span>
+          <canvas id="draw-preview" class="draw-preview"></canvas>
+
+          <span class="hint" id="draw-status"></span>
+          <div class="rowActions draw-actions">
+            <button id="draw-import" class="btn-secondary">Загрузить PNG</button>
+            <button id="draw-send" class="btn-accent">На проверку</button>
+          </div>
+          <input id="draw-file" type="file" accept="image/png" hidden />
+          <span class="hint" id="draw-hint"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ══ Модалка переноса из другого лаунчера ══ -->
   <div class="overlay" id="migrate-overlay" hidden>
     <div class="modal modal-wide">
@@ -297,27 +570,27 @@
         <span class="label">Что перенести</span>
         <div class="mig-grid">
           <label class="mig-card"><input id="mig-options" type="checkbox" checked />
-            <span class="mig-ico">🎛️</span>
+            <span class="mig-ico"><svg class="ic"><use href="#ic-sliders"/></svg></span>
             <span class="mig-name">Настройки игры</span>
             <span class="mig-desc">управление · графика · звук</span></label>
           <label class="mig-card"><input id="mig-servers" type="checkbox" checked />
-            <span class="mig-ico">🌐</span>
+            <span class="mig-ico"><svg class="ic"><use href="#ic-globe"/></svg></span>
             <span class="mig-name">Список серверов</span>
             <span class="mig-desc">все добавленные адреса</span></label>
           <label class="mig-card"><input id="mig-resourcepacks" type="checkbox" checked />
-            <span class="mig-ico">🎨</span>
+            <span class="mig-ico"><svg class="ic"><use href="#ic-palette"/></svg></span>
             <span class="mig-name">Ресурспаки</span>
             <span class="mig-desc">текстуры и паки</span></label>
           <label class="mig-card"><input id="mig-shaderpacks" type="checkbox" checked />
-            <span class="mig-ico">✨</span>
+            <span class="mig-ico"><svg class="ic"><use href="#ic-sparkle"/></svg></span>
             <span class="mig-name">Шейдеры</span>
             <span class="mig-desc">графика Iris/OptiFine</span></label>
           <label class="mig-card"><input id="mig-saves" type="checkbox" checked />
-            <span class="mig-ico">🗺️</span>
+            <span class="mig-ico"><svg class="ic"><use href="#ic-map"/></svg></span>
             <span class="mig-name">Одиночные миры</span>
             <span class="mig-desc">твои сохранения</span></label>
           <label class="mig-card"><input id="mig-configs" type="checkbox" checked />
-            <span class="mig-ico">📍</span>
+            <span class="mig-ico"><svg class="ic"><use href="#ic-pin"/></svg></span>
             <span class="mig-name">Данные модов</span>
             <span class="mig-desc">вейпоинты · схематики · эмоции</span></label>
         </div>
@@ -331,6 +604,14 @@
     </div>
   </div>
 
+  <!-- Плашка режима настройки блоков: видна только когда body.blocks-edit -->
+  <div id="blocks-edit-bar" class="blocks-edit-bar" hidden>
+    <span>Тяни и бросай блоки · колесо — прозрачность · Shift+колесо — размер</span>
+    <button id="blocks-edit-done" class="btn-primary">Готово</button>
+  </div>
+
+  <script src="deepslate.js"></script>
+  <script src="model3d.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

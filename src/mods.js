@@ -11,6 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const os = require('os');
 const { fetch, Agent } = require('undici');
 
 const API = 'https://api.modrinth.com/v2';
@@ -121,8 +122,9 @@ const CURATED = {
     { slug: 'iris', ru: 'Шейдеры как в OptiFine — нужен для вкладки «Шейдеры»' },
     { slug: 'entityculling', ru: 'Не рисует мобов за стенами — ещё больше FPS' },
     { slug: 'ferrite-core', ru: 'Снижает расход оперативной памяти' },
+    // из голосовых рекомендуем ровно один — SVC (решение 31.07): две системы
+    // в подборке путали игроков, ставили обе и не понимали, где их слышно
     { slug: 'simple-voice-chat', ru: 'Голосовой чат SVC — работает на Mist MC' },
-    { slug: 'plasmo-voice', ru: 'Голосовой чат Plasmo — работает на Mist MC' },
     { slug: 'xaeros-minimap', ru: 'Миникарта (радар игроков на Mist MC отключён сервером)' },
     { slug: 'xaeros-world-map', ru: 'Полная карта мира — дополнение к миникарте Xaero' },
     { slug: 'clientsort', ru: 'Сортировка инвентаря колёсиком/клавишей' },
@@ -600,13 +602,20 @@ function readZipEntry(file, wantName) {
   return null;
 }
 
-/** fabric.mod.json джарника: { id, version, depends } (null — не фабрик-мод). */
+/** fabric.mod.json джарника: { id, version, depends, breaks } (null — не фабрик-мод). */
 function fabricModInfo(file) {
   try {
     const raw = readZipEntry(file, 'fabric.mod.json');
     if (!raw) return null;
     const j = JSON.parse(raw.toString('utf8').replace(/^﻿/, ''));
-    return { id: j.id, version: String(j.version || ''), depends: j.depends || {} };
+    return {
+      id: j.id,
+      version: String(j.version || ''),
+      depends: j.depends || {},
+      // breaks — жёсткая несовместимость («Incompatible mods found» на старте).
+      // Именно её объявляет Sodium: 0.8.13 breaks iris <=1.10.7.
+      breaks: j.breaks || {},
+    };
   } catch (_) { return null; }
 }
 
@@ -619,9 +628,12 @@ function fabricModInfo(file) {
 /** «0.8.7+mc1.21.11» → { nums:[0,8,7], pre:null }; null — не разобрали. */
 function parseVer(v) {
   const s = String(v || '').trim().split('+')[0];
-  const m = s.match(/^(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?$/);
+  // хвостовой дефис без пререлиза («0.27.14-») — fabric-нотация «самый
+  // ранний пререлиз этой версии»: у malilib/litematica все требования такие.
+  // Пустой pre ('') — валидное значение «ниже любого пререлиза», null — релиз.
+  const m = s.match(/^(\d+)\.(\d+)(?:\.(\d+))?(?:-([0-9A-Za-z.-]*))?$/);
   if (!m) return null;
-  return { nums: [+m[1], +m[2], m[3] === undefined ? 0 : +m[3]], pre: m[4] || null };
+  return { nums: [+m[1], +m[2], m[3] === undefined ? 0 : +m[3]], pre: m[4] === undefined ? null : m[4] };
 }
 
 /** Сравнение по semver: пререлиз меньше релиза (0.8.14-beta.1 < 0.8.14). */
@@ -630,8 +642,8 @@ function cmpVer(a, b) {
     if (a.nums[i] !== b.nums[i]) return a.nums[i] < b.nums[i] ? -1 : 1;
   }
   if (a.pre === b.pre) return 0;
-  if (!a.pre) return 1;
-  if (!b.pre) return -1;
+  if (a.pre === null) return 1; // именно null: пустой pre ('') — НИЖЕ всех пререлизов
+  if (b.pre === null) return -1;
   const ap = a.pre.split('.');
   const bp = b.pre.split('.');
   for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
@@ -713,76 +725,279 @@ function guessModVersion(versionNumber, mcVersion) {
   return m ? m[1] : null;
 }
 
+/** Версии проекта под текущие loader/MC — кэш на процесс (резолвер зовёт часто). */
+const versionListCache = new Map();
+async function listProjectVersions(projectId, loader, mcVersion) {
+  const key = projectId + '|' + loader + '|' + mcVersion;
+  if (versionListCache.has(key)) return versionListCache.get(key);
+  let out = [];
+  try {
+    out = await apiGet(API + '/project/' + encodeURIComponent(projectId) + '/version?loaders='
+      + encodeURIComponent(JSON.stringify([loader]))
+      + '&game_versions=' + encodeURIComponent(JSON.stringify([mcVersion]))) || [];
+  } catch (_) { out = []; }
+  if (!Array.isArray(out)) out = [];
+  versionListCache.set(key, out);
+  return out;
+}
+
 /**
- * Сверка требований установленных модов друг к другу по fabric.mod.json —
- * ЕДИНСТВЕННЫЙ авторитет по версиям (пины Modrinth = лишь «с чем тестировали»).
- * Собираем ВСЕ требования на каждый мод (точные и диапазоны), и если стоящая
- * версия хоть одно нарушает — ставим самую свежую, устраивающую ВСЕХ сразу.
- * Классический кейс: Iris пинил Sodium 0.8.7, а Sodium Extra требует >=0.8.13 →
- * игра падала на старте; теперь выбирается 0.8.13, подходящий обоим.
- * Сеть упала — молча выходим, играем как есть.
+ * depends/breaks версии-кандидата. Modrinth их не отдаёт (dependencies в API —
+ * только «какой проект нужен», без диапазонов), поэтому качаем jar во временный
+ * файл и читаем fabric.mod.json. Кэш по versionId — за проход качаем единицы.
  */
-async function enforceJarDeps(gameDir, loader, mcVersion, log) {
-  if (loader !== 'fabric') return;
+const jarMetaCache = new Map();
+async function metaOfVersion(version) {
+  if (jarMetaCache.has(version.id)) return jarMetaCache.get(version.id);
+  let out = null;
+  const file = (version.files || []).find((f) => f.primary) || (version.files || [])[0];
+  if (file && file.url) {
+    const tmp = path.join(os.tmpdir(), 'mistmc-meta-' + version.id + '.jar');
+    try {
+      const res = await robustFetch(file.url);
+      if (res.ok) {
+        fs.writeFileSync(tmp, Buffer.from(await res.arrayBuffer()));
+        out = fabricModInfo(tmp);
+      }
+    } catch (_) { out = null; }
+    try { fs.unlinkSync(tmp); } catch (_) { /* уже нет */ }
+  }
+  jarMetaCache.set(version.id, out);
+  return out;
+}
+
+/** Активные моды: modid → { entry, info } по fabric.mod.json файла. */
+function scanFabricState(gameDir, loader) {
   const m = readManifest(gameDir);
-  const active = m.user.filter((e) => e.type === 'mod' && e.loader === loader
-    && e.enabled && !e.pendingRemove);
-  // modid → манифест-запись + фактическая версия из jar
-  const byModId = new Map();
-  const infos = [];
-  for (const e of active) {
+  const state = new Map();
+  // жёсткие несовместимости из нашей таблицы — как будто мод их сам объявил
+  const withKnown = (info) => {
+    const extra = KNOWN_BREAKS[info.id];
+    return extra ? { ...info, breaks: { ...(info.breaks || {}), ...extra } } : info;
+  };
+  for (const e of m.user) {
+    if (e.type !== 'mod' || e.loader !== loader || !e.enabled || e.pendingRemove) continue;
     const p = filePathOf(gameDir, e);
     if (!fs.existsSync(p)) continue;
     const info = fabricModInfo(p);
     if (!info || !info.id) continue;
-    byModId.set(info.id, { entry: e, version: info.version });
-    infos.push({ entry: e, info });
+    state.set(info.id, { entry: e, info: withKnown(info) });
   }
-
-  // modid → [{by, constraint}] по всем установленным модам
-  const wants = new Map();
-  for (const { entry, info } of infos) {
-    for (const [depId, constraint] of Object.entries(info.depends || {})) {
-      if (depId === info.id || !byModId.has(depId)) continue; // не наш управляемый мод
-      if (!wants.has(depId)) wants.set(depId, []);
-      wants.get(depId).push({ by: entry.title, constraint });
-    }
-  }
-
-  for (const [depId, reqs] of wants) {
-    const have = byModId.get(depId);
-    const bad = reqs.filter((r) => !satisfies(have.version, r.constraint));
-    if (!bad.length) continue;
-    log('⚑ ' + have.entry.title + ' ' + have.version + ' не устраивает: '
-      + bad.map((r) => r.by + ' требует ' + fmtConstraint(r.constraint)).join('; ')
-      + ' — подбираю версию');
+  // Джарники, закинутые в папку руками, для Fabric такие же моды — их
+  // требования тоже валят игру на старте (реальный кейс: replaymod +
+  // replayvoicechat руками, резолвер их не видел и конфликт доехал до
+  // экрана «Incompatible mods»). Modrinth-подбора у них нет (projectId
+  // неизвестен), но конфликт с их участием решается соседями или, в
+  // крайнем случае, усыплением файла.
+  if (loader === 'fabric') {
+    const dir = contentDir(gameDir, 'mod');
     try {
-      const versions = await apiGet(API + '/project/'
-        + encodeURIComponent(have.entry.projectId) + '/version?loaders='
-        + encodeURIComponent(JSON.stringify([loader]))
-        + '&game_versions=' + encodeURIComponent(JSON.stringify([mcVersion])));
-      // версия должна устраивать ВСЕ требования разом, не только нарушенные
-      const fits = (versions || [])
-        .map((v) => ({ v, ver: guessModVersion(v.version_number, mcVersion) }))
-        .filter((c) => c.ver && reqs.every((r) => satisfies(c.ver, r.constraint)));
-      // API отдаёт от новых к старым; стабильную предпочитаем бете
-      const pick = fits.find((c) => c.v.version_type === 'release') || fits[0];
-      if (!pick) {
-        log('  ! под ' + mcVersion + ' нет версии ' + have.entry.title
-          + ', устраивающей все моды — выключи один из конфликтующих');
-        continue;
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith('.jar')) continue;
+        const info = fabricModInfo(path.join(dir, f));
+        if (!info || !info.id || state.has(info.id)) continue;
+        state.set(info.id, {
+          entry: { type: 'mod', fileName: f, title: info.id, projectId: null, slug: null, loader },
+          info: withKnown(info),
+          manual: true,
+        });
       }
-      log('  → ' + have.entry.title + ' ' + have.version + ' → ' + pick.ver);
-      await installContent(gameDir, {
-        projectId: have.entry.projectId,
-        slug: have.entry.slug,
-        title: have.entry.title,
-        iconUrl: have.entry.iconUrl || '',
-      }, 'mod', loader, mcVersion, log, 4, pick.v.id);
-    } catch (e2) {
-      log('  ! не удалось привести версию: ' + e2.message);
+    } catch (_) { /* папки может не быть на самом первом запуске */ }
+  }
+  return state;
+}
+
+/**
+ * Известные несовместимости, которые сами моды НЕ объявляют (depends "*"),
+ * а видно их только по крашу мижина. Дополняем breaks при сканировании —
+ * дальше обычный резолвер сам откатит версию или выключит виновника.
+ * Кейс 02.08: online-patpat 1.1 мижинит старый API PatPat и падает на 1.3+.
+ */
+const KNOWN_BREAKS = {
+  'online-patpat': { patpat: '>=1.3.0-' },
+};
+
+/** Первое нарушение: чужой depends не выполнен либо чужой breaks накрыл версию. */
+function firstFabricConflict(state) {
+  for (const { info } of state.values()) {
+    for (const [depId, c] of Object.entries(info.depends || {})) {
+      if (depId === info.id) continue;
+      const t = state.get(depId);
+      if (t && !satisfies(t.info.version, c)) {
+        return { kind: 'dep', targetId: depId, byId: info.id, constraint: c };
+      }
+    }
+    for (const [badId, c] of Object.entries(info.breaks || {})) {
+      if (badId === info.id) continue;
+      const t = state.get(badId);
+      if (t && satisfies(t.info.version, c)) {
+        return { kind: 'break', targetId: badId, byId: info.id, constraint: c };
+      }
     }
   }
+  return null;
+}
+
+/** Устроит ли версия modId всех прочих установленных (их depends и breaks). */
+function versionFitsOthers(state, modId, version) {
+  for (const { info } of state.values()) {
+    if (info.id === modId) continue;
+    const dep = (info.depends || {})[modId];
+    if (dep && !satisfies(version, dep)) return false;
+    const br = (info.breaks || {})[modId];
+    if (br && satisfies(version, br)) return false;
+  }
+  return true;
+}
+
+/** Не ломается ли сам кандидат об уже стоящие моды (его depends/breaks). */
+function candidateFitsState(state, meta, selfId) {
+  for (const [depId, c] of Object.entries(meta.depends || {})) {
+    if (depId === selfId) continue;
+    const t = state.get(depId);
+    if (t && !satisfies(t.info.version, c)) return false;
+  }
+  for (const [badId, c] of Object.entries(meta.breaks || {})) {
+    if (badId === selfId) continue;
+    const t = state.get(badId);
+    if (t && satisfies(t.info.version, c)) return false;
+  }
+  return true;
+}
+
+/** Снимает ли кандидат мода byId именно этот конфликт. */
+function candidateResolves(state, conflict, meta) {
+  const target = state.get(conflict.targetId);
+  if (!target) return true;
+  if (conflict.kind === 'break') {
+    const br = (meta.breaks || {})[conflict.targetId];
+    return !br || !satisfies(target.info.version, br);
+  }
+  const dep = (meta.depends || {})[conflict.targetId];
+  return !dep || satisfies(target.info.version, dep);
+}
+
+/** Сколько jar-ов кандидатов качаем на один конфликт (метаданные лежат внутри). */
+const MAX_CANDIDATE_PROBES = 8;
+
+/**
+ * Сверка требований установленных модов друг к другу по fabric.mod.json —
+ * ЕДИНСТВЕННЫЙ авторитет по версиям (пины Modrinth = лишь «с чем тестировали»).
+ * Учитываем ОБА раздела: depends («нужна версия не ниже») и breaks («с этой
+ * версией не работаю») — второй раньше игнорировался, и игроки ловили
+ * «Incompatible mods found»: Sodium 0.8.13 объявляет breaks iris <=1.10.7,
+ * а свежее Iris 1.10.7 под 1.21.11 просто нет.
+ *
+ * Разрешение конфликта по кругу (до 6 проходов, чтобы правки не зациклились):
+ *   1) подобрать версию «жертвы», которая устраивает вообще всех;
+ *   2) если такой нет — понизить того, кто предъявил требование, и закрепить
+ *      его версию; сломанные этим третьи моды чинятся следующим проходом
+ *      (Sodium 0.8.12 → Sodium Extra 0.9.3 больше не подходит → 0.9.1).
+ * Сеть упала — молча выходим, играем как есть.
+ */
+async function enforceJarDeps(gameDir, loader, mcVersion, log) {
+  if (loader !== 'fabric') return;
+  const locked = new Set();
+
+  for (let pass = 0; pass < 6; pass++) {
+    const state = scanFabricState(gameDir, loader);
+    const conflict = firstFabricConflict(state);
+    if (!conflict) return;
+
+    const target = state.get(conflict.targetId);
+    const by = state.get(conflict.byId);
+    if (!target || !by) return;
+    log(conflict.kind === 'break'
+      ? '⚑ ' + by.entry.title + ' ' + by.info.version + ' не работает с '
+        + target.entry.title + ' ' + target.info.version + ' — подбираю версии'
+      : '⚑ ' + target.entry.title + ' ' + target.info.version + ' не устраивает '
+        + by.entry.title + ' (нужно ' + fmtConstraint(conflict.constraint) + ') — подбираю версии');
+
+    let applied = false;
+
+    // 1) двигаем «жертву» — версию, на которую жалуются
+    if (!locked.has(conflict.targetId)) {
+      applied = await tryReplace(gameDir, loader, mcVersion, log, state, conflict, target,
+        (ver) => versionFitsOthers(state, conflict.targetId, ver), null);
+      if (applied) locked.add(conflict.targetId);
+    }
+
+    // 2) не вышло — двигаем того, кто предъявил требование
+    if (!applied && !locked.has(conflict.byId)) {
+      applied = await tryReplace(gameDir, loader, mcVersion, log, state, conflict, by,
+        null, conflict);
+      if (applied) locked.add(conflict.byId);
+    }
+
+    if (!applied) {
+      // Последний рубеж: версию не подобрали (Modrinth молчит или её нет) —
+      // усыпляем мод, который предъявил требование, иначе Fabric встретит
+      // игрока экраном «Incompatible mods found» вместо игры. Мод остаётся
+      // во вкладке «Мои моды» выключенным — включить обратно один клик.
+      try {
+        const p = filePathOf(gameDir, by.entry);
+        if (fs.existsSync(p)) fs.renameSync(p, fs.existsSync(p + '.disabled') ? p + '.disabled2' : p + '.disabled');
+        const man = readManifest(gameDir);
+        const e = man.user.find((x) => x.fileName === by.entry.fileName && x.type === 'mod');
+        if (e) { e.enabled = false; writeManifest(gameDir, man); }
+        log('  − ' + by.entry.title + ' временно выключен: требует ' + target.entry.title
+          + ' ' + fmtConstraint(conflict.constraint) + ', совместимой версии не нашлось');
+        locked.add(conflict.byId);
+        continue; // конфликт снят выключением — проверяем, не остался ли следующий
+      } catch (e) {
+        log('  ! не смог выключить ' + by.entry.title + ': ' + e.message);
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * Подобрать и поставить версию мода `slotEntry`. `fitsByVersionString` — дешёвая
+ * проверка по номеру версии (для «жертвы»), `resolveFor` — конфликт, который
+ * кандидат обязан снять (для «источника требования»); в обоих случаях кандидат
+ * дополнительно не должен ломаться о текущий набор модов.
+ */
+async function tryReplace(gameDir, loader, mcVersion, log, state, conflict, slot,
+  fitsByVersionString, resolveFor) {
+  const versions = await listProjectVersions(slot.entry.projectId, loader, mcVersion);
+  if (!versions.length) return false;
+  const ordered = versions
+    .map((v) => ({ v, ver: guessModVersion(v.version_number, mcVersion) }))
+    .filter((c) => c.ver && c.ver !== slot.info.version.split('+')[0]);
+  // стабильные раньше бет, внутри — как отдал API (от новых к старым)
+  const queue = ordered.filter((c) => c.v.version_type === 'release')
+    .concat(ordered.filter((c) => c.v.version_type !== 'release'));
+
+  let probes = 0;
+  for (const cand of queue) {
+    // сверяем и очищенную версию («2.6.25»), и полную строку Modrinth
+    // («1.21.11-2.6.25»): точные пины вроде Replay Voice Chat → Replay Mod
+    // записаны полной строкой, и очищенная их не проходила
+    if (fitsByVersionString && !fitsByVersionString(cand.ver)
+        && !fitsByVersionString(String(cand.v.version_number || ''))) continue;
+    if (probes++ >= MAX_CANDIDATE_PROBES) break;
+    const meta = await metaOfVersion(cand.v);
+    if (!meta) continue;
+    if (!candidateFitsState(state, meta, slot.info.id)) continue;
+    if (resolveFor && !candidateResolves(state, resolveFor, meta)) continue;
+    if (!resolveFor) {
+      // «жертву» ставим только если она реально снимает конфликт
+      const c = conflict.kind === 'break'
+        ? !satisfies(meta.version, (state.get(conflict.byId).info.breaks || {})[conflict.targetId] || '')
+        : satisfies(meta.version, conflict.constraint);
+      if (!c) continue;
+    }
+    log('  → ' + slot.entry.title + ' ' + slot.info.version + ' → ' + (cand.ver || '?'));
+    const r = await installContent(gameDir, {
+      projectId: slot.entry.projectId,
+      slug: slot.entry.slug,
+      title: slot.entry.title,
+      iconUrl: slot.entry.iconUrl || '',
+    }, 'mod', loader, mcVersion, log, 4, cand.v.id);
+    if (r && r.ok) return true;
+  }
+  return false;
 }
 
 // ── синхронизация модов перед запуском ─────────────────────────────────
@@ -841,6 +1056,60 @@ function syncMods(gameDir, loader, bundledDir, log) {
       log('  ! ' + entry.fileName + ': ' + e.message);
     }
   }
+
+  // Дубликаты mod id валят Fabric на старте («Duplicate mod id») ещё до окна
+  // игры: игрок положил свой fabric-api/modmenu, а мы докинули вшитый той же
+  // сути. Оставляем вшитый (он подобран под сборку Mist), копию игрока
+  // усыпляем в .dupe.disabled — вернуть можно переименованием.
+  if (loader === 'fabric') {
+    const dir = contentDir(gameDir, 'mod');
+    const byId = new Map(); // id → [{file, bundled}]
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jar')) continue;
+      const info = fabricModInfo(path.join(dir, f));
+      if (!info || !info.id) continue;
+      if (!byId.has(info.id)) byId.set(info.id, []);
+      byId.get(info.id).push({ file: f, bundled: bundled.includes(f) });
+    }
+    for (const [id, files] of byId) {
+      if (files.length < 2) continue;
+      const keep = files.find((x) => x.bundled) || files[0];
+      for (const x of files) {
+        if (x === keep) continue;
+        try {
+          fs.renameSync(path.join(dir, x.file), path.join(dir, x.file + '.dupe.disabled'));
+          log('  − ' + x.file + ' (дубликат ' + id + ', оставлен ' + keep.file + ')');
+        } catch (e) {
+          log('  ! дубликат ' + x.file + ' не отключился: ' + e.message);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Выключить мод по его fabric-id (виновник краша из разбора лога).
+ * Ищем джарник по fabric.mod.json среди всех в папке — и реестровых, и
+ * закинутых руками. Возвращает имя файла или null, если не нашли/не вышло.
+ */
+function disableModById(gameDir, loader, modId, log) {
+  const dir = contentDir(gameDir, 'mod');
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jar')) continue;
+      const info = fabricModInfo(path.join(dir, f));
+      if (!info || info.id !== modId) continue;
+      const p = path.join(dir, f);
+      fs.renameSync(p, fs.existsSync(p + '.disabled') ? p + '.disabled2' : p + '.disabled');
+      const m = readManifest(gameDir);
+      const e = m.user.find((x) => x.type === 'mod' && x.fileName === f);
+      if (e) { e.enabled = false; writeManifest(gameDir, m); }
+      return f;
+    }
+  } catch (e) {
+    if (log) log('  ! не смог выключить ' + modId + ': ' + e.message);
+  }
+  return null;
 }
 
 // ── сборка игрока: экспорт кодом и применение ───────────────────────────
@@ -1104,6 +1373,7 @@ module.exports = {
   toggleUserContent,
   toggleBundledMod,
   removeUserContent,
+  disableModById,
   syncMods,
   enforceJarDeps,
   collectClientInventory,

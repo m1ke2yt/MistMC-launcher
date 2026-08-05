@@ -1,6 +1,7 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, safeStorage, protocol, net } = require('electron');
+const { pathToFileURL } = require('url');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -12,14 +13,51 @@ const msauth = require('./msauth');
 const mods = require('./mods');
 const rpc = require('./discordrpc');
 const respack = require('./respack');
+const cosmeticpack = require('./cosmeticpack');
+const cosmeticassets = require('./cosmeticassets');
 const migrate = require('./migrate');
 const translate = require('./translate');
 const community = require('./community');
 const buildSecret = require('./build-secret');
+const filelog = require('./filelog');
+
+// Файловый лог — раньше всего остального: падения на старте должны попасть
+// в журнал, даже если окно так и не открылось.
+filelog.init(app.getPath('userData'));
+filelog.line('════ Запуск Mist MC Launcher ' + app.getVersion()
+  + ' · Electron ' + process.versions.electron
+  + ' · ' + process.platform + ' ' + require('os').release()
+  + (app.isPackaged ? '' : ' · DEV'));
+filelog.line('exe: ' + process.execPath);
+if (process.argv.length > 1) filelog.line('argv: ' + process.argv.slice(1).join(' '));
+
+process.on('uncaughtException', (err) => {
+  filelog.crash('Необработанная ошибка главного процесса', err);
+  try {
+    dialog.showErrorBox('Mist MC Launcher — ошибка',
+      'Лаунчер упал: ' + ((err && err.message) || err) + '\n\nЛог: ' + filelog.file());
+  } catch (_) {}
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => filelog.crash('Промис без catch', err));
+app.on('render-process-gone', (_e, _wc, details) => filelog.crash('Упал процесс окна (render-process-gone)', details));
+app.on('child-process-gone', (_e, details) => {
+  // GPU-процесс на битых видеодрайверах умирает молча — это главный
+  // подозреваемый в «окно мелькнуло и закрылось». reason=clean-exit — норма.
+  if (details && details.reason !== 'clean-exit') filelog.crash('Упал служебный процесс (' + (details.type || '?') + ')', details);
+});
 
 // На Linux при распаковке из архива chrome-sandbox не получает setuid-root →
 // стандартный sandbox падает. Отключаем его (безопасно для лаунчера в домашней папке).
 if (process.platform === 'linux') app.commandLine.appendSwitch('no-sandbox');
+
+// Свой протокол для фона окна. Через него отдаём картинку/видео из папки
+// настроек: renderer не имеет доступа к file://, а гнать видео в base64 —
+// это лишние мегабайты в памяти и никакой перемотки. Регистрировать нужно
+// ДО готовности приложения. stream: true обязателен для <video>.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'mistbg', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: false } },
+]);
 
 // ─── Константы проекта ────────────────────────────────────────────────
 const MC_VERSION = '1.21.11';
@@ -169,6 +207,8 @@ function loadConfig() {
     accountType: null, // 'offline' | 'msa' | null
     offlineName: null,
     discordRpc: true, // статус «Играет за <ник>» в Discord
+    // внешний вид: null = стандартная тема лаунчера
+    theme: { accent: null, bg: null, bgImage: null, bgOpacity: 45 },
   };
   try {
     const raw = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
@@ -248,7 +288,26 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.on('did-finish-load', () => filelog.line('окно загружено'));
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc) =>
+    filelog.crash('Окно не загрузилось', { code, desc }));
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  // Запуск из исходников (npx electron .) помечаем прямо в окне: собранный
+  // release-билд выглядит ТОЧНО так же, и правки «не видны» именно из-за
+  // запуска не того лаунчера — метка снимает вопрос раз и навсегда.
+  if (!app.isPackaged) {
+    mainWindow.setTitle('Mist MC Launcher · DEV (исходники)');
+    mainWindow.webContents.on('did-finish-load', () => {
+      mainWindow.webContents.executeJavaScript(`(() => {
+        const b = document.createElement('div');
+        b.textContent = 'DEV · исходники';
+        b.style.cssText = 'position:fixed;top:6px;right:96px;z-index:9999;' +
+          'background:#f59e0b;color:#000;font:600 11px sans-serif;' +
+          'padding:2px 8px;border-radius:6px;pointer-events:none;';
+        document.body.appendChild(b);
+      })()`).catch(() => {});
+    });
+  }
   // mainWindow.webContents.openDevTools({ mode: 'detach' });
 }
 
@@ -304,6 +363,17 @@ function setupAutoUpdate() {
 }
 
 app.whenReady().then(() => {
+  // Раздача фона окна: пускаем только файлы background.* из папки настроек —
+  // произвольный путь из renderer открыть нельзя.
+  protocol.handle('mistbg', (request) => {
+    try {
+      const name = decodeURIComponent(new URL(request.url).pathname.replace(/^\/+/, ''));
+      if (!/^background\.[a-z0-9]{2,5}$/i.test(name)) return new Response('', { status: 403 });
+      return net.fetch(pathToFileURL(bgImagePath(name)).toString());
+    } catch (_) {
+      return new Response('', { status: 404 });
+    }
+  });
   createWindow();
   setupAutoUpdate();
   translate.init(app.getPath('userData'));
@@ -314,7 +384,7 @@ app.whenReady().then(() => {
     rpc.setIdle(resolveAccount(cfg)?.name);
   }
 });
-app.on('will-quit', () => rpc.disable());
+app.on('will-quit', () => { filelog.line('════ Выход из лаунчера'); rpc.disable(); });
 app.on('window-all-closed', () => app.quit());
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
@@ -322,8 +392,8 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 function send(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
 }
-function status(text) { send('status', text); }
-function logLine(text) { send('log', text); }
+function status(text) { send('status', text); filelog.line('◆ ' + text); }
+function logLine(text) { send('log', text); filelog.line(text); }
 
 // Хартбит на сайт: «играю за <ник>» при запуске игры. Сайт склеит это с входом
 // на сервер (ловит вход через лаунчер любым способом). Fire-and-forget, 5с таймаут,
@@ -375,6 +445,160 @@ async function runTask(label, taskObj) {
 }
 
 // ─── IPC ──────────────────────────────────────────────────────────────
+// ─── Фоновая картинка темы ────────────────────────────────────────────
+// Файл кладём рядом с конфигом, а renderer получает его как data: URL —
+// CSP запрещает ему тянуть file://, зато data: в img-src разрешён.
+// Формат определяем по СОДЕРЖИМОМУ, а не по расширению: Windows сплошь и
+// рядом сохраняет JPEG как .jfif, встречаются .jpe, .bmp, .avif — по списку
+// расширений такие файлы отвергались, хотя открылись бы прекрасно.
+const BG_EXT_BY_MIME = {
+  'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp',
+  'image/gif': '.gif', 'image/bmp': '.bmp', 'image/avif': '.avif',
+  'image/x-icon': '.ico', 'image/svg+xml': '.svg',
+};
+// Видео фоном: transcode не делаем, отдаём как есть через свой протокол
+const BG_VIDEO_MIME = { 'video/mp4': '.mp4', 'video/webm': '.webm' };
+const BG_MAX_SOURCE = 80 * 1024 * 1024;  // исходник (видео бывает тяжёлым)
+const BG_MAX_STORED = 8 * 1024 * 1024;   // картинка, которая ложится в интерфейс
+const BG_MAX_VIDEO = 60 * 1024 * 1024;   // видео храним как есть
+const BG_MAX_SIDE = 2560;                // больше на фон всё равно не нужно
+
+function sniffImageMime(buf) {
+  const ascii = (from, to) => buf.toString('latin1', from, to);
+  if (buf.length < 12) return null;
+  if (buf[0] === 0x89 && ascii(1, 4) === 'PNG') return 'image/png';
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
+  if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') return 'image/gif';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return 'image/webp';
+  if (ascii(4, 8) === 'ftyp' && /avif|avis|mif1/.test(ascii(8, 20))) return 'image/avif';
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return 'image/bmp';
+  if (buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x01) return 'image/x-icon';
+  if (/<svg[\s>]/i.test(ascii(0, Math.min(buf.length, 600)))) return 'image/svg+xml';
+  // видео: mp4/mov опознаём по ftyp-бренду, webm — по сигнатуре Matroska
+  if (ascii(4, 8) === 'ftyp') {
+    const brand = ascii(8, 20);
+    if (/isom|mp4|avc1|iso2|M4V|qt/i.test(brand)) return 'video/mp4';
+  }
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return 'video/webm';
+  return null;
+}
+const isVideoMime = (m) => !!BG_VIDEO_MIME[m];
+
+function bgImagePath(name) {
+  return path.join(app.getPath('userData'), name);
+}
+/** Что показывать в фоне: { url, kind: 'image' | 'video' } или null. */
+function bgMedia(name) {
+  if (!name) return null;
+  try {
+    const p = bgImagePath(name);
+    const st = fs.statSync(p);
+    // сигнатуру читаем с начала файла — видео целиком в память не тянем
+    const fd = fs.openSync(p, 'r');
+    const head = Buffer.alloc(Math.min(1024, st.size));
+    fs.readSync(fd, head, 0, head.length, 0);
+    fs.closeSync(fd);
+    const mime = sniffImageMime(head);
+    if (!mime) return null;
+    // ?v= — чтобы окно не показывало прежний файл из кэша после замены
+    return {
+      url: 'mistbg://media/' + encodeURIComponent(name) + '?v=' + st.mtimeMs,
+      kind: isVideoMime(mime) ? 'video' : 'image',
+    };
+  } catch (_) {
+    return null; // файл удалили руками — просто рисуем без фона
+  }
+}
+
+/** Ужимаем тяжёлые картинки средствами Electron: иначе фото на 20 МБ
+ *  раздувается в base64 до 27 МБ и тормозит окно. Что не по зубам
+ *  (webp/avif/svg/анимации) — оставляем как есть, их рисует сам Chromium. */
+function shrinkImage(buf, mime) {
+  if (buf.length <= 1.5 * 1024 * 1024) return { buf, mime };
+  try {
+    const { nativeImage } = require('electron');
+    let img = nativeImage.createFromBuffer(buf);
+    if (img.isEmpty()) return { buf, mime };
+    const size = img.getSize();
+    if (Math.max(size.width, size.height) > BG_MAX_SIDE) {
+      img = size.width >= size.height
+        ? img.resize({ width: BG_MAX_SIDE, quality: 'good' })
+        : img.resize({ height: BG_MAX_SIDE, quality: 'good' });
+    }
+    const jpeg = img.toJPEG(88);
+    return jpeg && jpeg.length && jpeg.length < buf.length
+      ? { buf: jpeg, mime: 'image/jpeg' }
+      : { buf, mime };
+  } catch (_) {
+    return { buf, mime };
+  }
+}
+
+ipcMain.handle('pick-bg-image', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [
+      { name: 'Картинки и видео', extensions: ['png', 'jpg', 'jpeg', 'jfif', 'jpe', 'webp', 'gif', 'bmp', 'avif', 'ico', 'svg', 'mp4', 'webm'] },
+      { name: 'Все файлы', extensions: ['*'] },
+    ],
+  });
+  if (res.canceled || !res.filePaths.length) return { ok: false, canceled: true };
+  const src = res.filePaths[0];
+  try {
+    const st = fs.statSync(src);
+    if (st.size > BG_MAX_SOURCE) {
+      return { ok: false, error: 'Файл больше 80 МБ — возьми полегче' };
+    }
+    // сигнатуру смотрим по началу файла, не читая целиком (видео бывает большим)
+    const fd = fs.openSync(src, 'r');
+    const head = Buffer.alloc(Math.min(1024, st.size));
+    fs.readSync(fd, head, 0, head.length, 0);
+    fs.closeSync(fd);
+    const mime = sniffImageMime(head);
+    if (!mime) return { ok: false, error: 'Это не похоже на картинку или видео' };
+
+    let outMime = mime;
+    let buf;
+    if (isVideoMime(mime)) {
+      if (st.size > BG_MAX_VIDEO) {
+        return { ok: false, error: 'Видео больше 60 МБ — возьми покороче' };
+      }
+      buf = fs.readFileSync(src);
+    } else {
+      const shrunk = shrinkImage(fs.readFileSync(src), mime);
+      buf = shrunk.buf;
+      outMime = shrunk.mime;
+      if (buf.length > BG_MAX_STORED) {
+        return { ok: false, error: 'Картинку не удалось ужать — попробуй другую' };
+      }
+    }
+
+    const ext = BG_EXT_BY_MIME[outMime] || BG_VIDEO_MIME[outMime] || '.png';
+    const name = 'background' + ext;
+    // старые фоны других форматов убираем, иначе останутся мусором
+    const allExt = new Set([...Object.values(BG_EXT_BY_MIME), ...Object.values(BG_VIDEO_MIME)]);
+    for (const e of allExt) {
+      if (e !== ext) { try { fs.unlinkSync(bgImagePath('background' + e)); } catch (_) { /* нет файла */ } }
+    }
+    fs.writeFileSync(bgImagePath(name), buf);
+    const cfg = loadConfig();
+    cfg.theme = Object.assign({}, cfg.theme, { bgImage: name });
+    saveConfig(cfg);
+    return { ok: true, name, media: bgMedia(name), kind: isVideoMime(outMime) ? 'video' : 'image' };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('clear-bg-image', () => {
+  const cfg = loadConfig();
+  const name = cfg.theme && cfg.theme.bgImage;
+  if (name) { try { fs.unlinkSync(bgImagePath(name)); } catch (_) { /* уже нет */ } }
+  cfg.theme = Object.assign({}, cfg.theme, { bgImage: null });
+  saveConfig(cfg);
+  return { ok: true };
+});
+
 ipcMain.handle('get-config', () => {
   const config = loadConfig();
   // версию лаунчера отдаём отсюда, а не из VERSION_INFO: getVersion() доступен
@@ -383,6 +607,7 @@ ipcMain.handle('get-config', () => {
     config,
     versionInfo: { ...VERSION_INFO, launcher: app.getVersion() },
     account: resolveAccount(config),
+    bgMedia: bgMedia(config.theme && config.theme.bgImage),
   };
 });
 // Renderer шлёт только игровые настройки — мержим по белому списку, иначе
@@ -390,7 +615,7 @@ ipcMain.handle('get-config', () => {
 ipcMain.handle('save-config', (_e, patch) => {
   const cfg = loadConfig();
   const rpcWas = cfg.discordRpc !== false;
-  for (const k of ['ram', 'loader', 'joinServer', 'gameDir', 'discordRpc']) {
+  for (const k of ['ram', 'loader', 'joinServer', 'gameDir', 'discordRpc', 'theme']) {
     if (patch && k in patch) cfg[k] = patch[k];
   }
   saveConfig(cfg);
@@ -566,7 +791,22 @@ ipcMain.handle('mods-popular', async (_e, { type, loader }) => {
 });
 ipcMain.handle('mod-install', async (_e, { project, type, loader }) => {
   try {
-    return await mods.installContent(currentGameDir(), project, type, loader, MC_VERSION, logLine);
+    const res = await mods.installContent(currentGameDir(), project, type, loader, MC_VERSION, logLine);
+    // Совместимость проверяем СРАЗУ при установке, а не при запуске игры:
+    // разруливатель подберёт версии по fabric.mod.json, а его рассказ о том,
+    // что он сделал (заменил/выключил и почему), показываем игроку в карточке.
+    if (res && res.ok && !res.already && type === 'mod' && loader === 'fabric') {
+      const notes = [];
+      try {
+        await mods.enforceJarDeps(currentGameDir(), loader, MC_VERSION, (s) => {
+          logLine(s);
+          const line = String(s).trim();
+          if (line.startsWith('⚑') || line.startsWith('−') || line.startsWith('→') || line.startsWith('!')) notes.push(line);
+        });
+      } catch (_) { /* без сети — разрулит проверка перед запуском */ }
+      if (notes.length) return { ...res, notes };
+    }
+    return res;
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -592,6 +832,53 @@ ipcMain.handle('community-vote', async (_e, { project, value }) => {
 });
 ipcMain.handle('community-ratings', (_e, { ids }) => community.ratings(ids, currentNick()));
 ipcMain.handle('community-top', (_e, { type }) => community.top(type, 25));
+
+ipcMain.handle('cosmetics-list', () => community.cosmetics(currentNick()));
+ipcMain.handle('cosmetics-action', (_e, { action, id, slot }) => {
+  const nick = currentNick();
+  if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
+  return community.cosmeticAction(nick, action, id, slot);
+});
+
+// Модели косметики для витрины: витрина показывает саму вещь на персонаже,
+// а модели живут в паке — достаём их и отдаём окну.
+ipcMain.handle('cosmetic-assets', async () => {
+  const manifest = await community.cosmeticPack(currentNick());
+  if (!manifest || !manifest.ok) return { ok: false, error: (manifest && manifest.error) || 'сайт недоступен' };
+  return cosmeticassets.collect(app.getPath('userData'), manifest, logLine);
+});
+ipcMain.handle('cosmetic-drawn-model', async (_e, { kind, png }) => {
+  const manifest = await community.cosmeticPack(currentNick());
+  if (!manifest || !manifest.ok) return { ok: false, error: 'сайт недоступен' };
+  const model = await cosmeticassets.drawnModel(app.getPath('userData'), manifest, kind, png, logLine);
+  return model ? { ok: true, model } : { ok: false, error: 'модель не найдена' };
+});
+
+// Свой скин: заливаем на сайт, оттуда его берёт сервер (SkinsRestorer).
+ipcMain.handle('skin-apply', (_e, { png, slim }) => {
+  const nick = currentNick();
+  if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
+  return community.applySkin(nick, png, !!slim);
+});
+ipcMain.handle('skin-reset', () => {
+  const nick = currentNick();
+  if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
+  return community.resetSkin(nick);
+});
+// Какой скин показывать в примерочной: свой с сайта, если поставлен
+ipcMain.handle('skin-state', () => {
+  const nick = currentNick();
+  if (!nick) return { ok: true, url: null };
+  return community.skinState(nick);
+});
+
+// Рисованные плащи и флаги: состояние своих заявок и отправка на модерацию.
+ipcMain.handle('drawings-list', () => community.drawings(currentNick()));
+ipcMain.handle('drawing-submit', (_e, { kind, png }) => {
+  const nick = currentNick();
+  if (!nick) return { ok: false, error: 'Сначала войдите в аккаунт' };
+  return community.submitDrawing(nick, kind, png);
+});
 
 ipcMain.handle('build-share', async (_e, { loader, parts }) => {
   const nick = currentNick();
@@ -694,7 +981,19 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     const mc = MinecraftFolder.from(gameDir);
     const javaPath = bundledJavaPath();
     if (!fs.existsSync(javaPath)) {
-      throw new Error('Не найден Java runtime (' + javaPath + '). Пересоберите лаунчер с JRE.');
+      // Путь вида C:\Temp\Rar$EX...rartemp\ = игрок запустил exe двойным кликом
+      // ПРЯМО ИЗ ОКНА АРХИВАТОРА: во времянку распаковывается только сам exe,
+      // а resources/jre остаётся в архиве (живой случай 04.08).
+      if (/rar\$|rartemp|[\\/]7z[A-Za-z0-9]{4,}[\\/]|[\\/]wz[a-z0-9]+[\\/]/i.test(javaPath)) {
+        throw new Error('Лаунчер запущен прямо из окна архиватора — так распаковывается ' +
+          'только часть файлов. Распакуйте архив ЦЕЛИКОМ в отдельную папку и запустите ' +
+          'оттуда, а лучше скачайте установщик с mistmc.gg/downloads.');
+      }
+      // Иначе такое у игроков = антивирус унёс javaw.exe в карантин или
+      // установка оборвалась (мало места). Сборка без JRE — только у разработчика.
+      throw new Error('Не найден Java runtime (' + javaPath + '). ' +
+        'Обычно его удаляет антивирус — проверьте карантин и добавьте папку лаунчера ' +
+        'в исключения, затем переустановите лаунчер с mistmc.gg/downloads.');
     }
     ensureExecutable(javaPath);
 
@@ -742,6 +1041,25 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     status('Проверка ресурспака…');
     await respack.syncResourcePack(gameDir, logLine);
 
+    // 3.6) Косметика: свой пак игрока с плащами и флагами. Собирается локально
+    // и обновляется по описи с сайта — одобренный чужой плащ приезжает сразу,
+    // а не с общим паком по расписанию.
+    await cosmeticpack.syncCosmeticPack(gameDir, account.name, community, logLine);
+
+    // 3.7) Конфиг мода MistCapes: при отладке против локального прокси
+    // (MISTMC_SITE_URL) мод плащей должен смотреть туда же; на проде
+    // конфиг убираем — мод живёт на своём дефолте https://mistmc.gg
+    try {
+      const capesCfg = path.join(gameDir, 'config', 'mistcapes.json');
+      if (process.env.MISTMC_SITE_URL) {
+        fs.mkdirSync(path.dirname(capesCfg), { recursive: true });
+        fs.writeFileSync(capesCfg, JSON.stringify({ base: SITE_URL }));
+        logLine('  + плащи MistCapes → ' + SITE_URL);
+      } else if (fs.existsSync(capesCfg)) {
+        fs.unlinkSync(capesCfg);
+      }
+    } catch (_) { /* косметика не должна мешать запуску */ }
+
     // 4) Запуск
     status('Запуск игры…');
     // метка «через лаунчер» + инвентаризация модов/паков для админки
@@ -764,9 +1082,14 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       quickPlayMultiplayer: joinServer ? JOIN_HOST : undefined,
     });
 
-    // Логи процесса (кратко)
-    if (proc.stdout) proc.stdout.on('data', (d) => logLine(d.toString().trimEnd()));
-    if (proc.stderr) proc.stderr.on('data', (d) => logLine(d.toString().trimEnd()));
+    // Логи процесса (кратко) + хвост для разбора краша: если игра упала из-за
+    // мижина стороннего мода, по этому хвосту находим виновника
+    let gameLogTail = '';
+    const keepTail = (chunk) => {
+      gameLogTail = (gameLogTail + chunk).slice(-65536);
+    };
+    if (proc.stdout) proc.stdout.on('data', (d) => { const s = d.toString(); keepTail(s); logLine(s.trimEnd()); });
+    if (proc.stderr) proc.stderr.on('data', (d) => { const s = d.toString(); keepTail(s); logLine(s.trimEnd()); });
 
     const watcher = createMinecraftProcessWatcher(proc);
     watcher.on('error', (err) => {
@@ -788,6 +1111,22 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       logLine('■ Игра закрыта (код ' + code + ')');
       if (code !== 0 && crashReport) {
         logLine('Крэш-репорт: ' + crashReportLocation);
+      }
+      // Краш из-за мижина стороннего мода (типовое: мод-аддон не пережил
+      // обновление мода-хозяина). Резолвер такое не поймает — depends "*",
+      // поэтому выключаем виновника по факту и рассказываем игроку.
+      if (code !== 0) {
+        const m = /Mixin apply for mod ([a-z0-9_.-]+) failed/i.exec(gameLogTail)
+          || /Mixin \[[^\]]+ from mod ([a-z0-9_.-]+)\][^\n]*FAILED during APPLY/i.exec(gameLogTail);
+        if (m) {
+          const badId = m[1];
+          const off = mods.disableModById(gameDir, loader, badId, logLine);
+          if (off) {
+            logLine('⚑ Игра упала из-за мода «' + off + '» — он временно выключен.');
+            logLine('  Запусти игру ещё раз; вернуть мод можно во вкладке «Мои моды».');
+            send('launch-error', 'Игра упала из-за мода «' + off + '» — он выключен, запусти ещё раз.');
+          }
+        }
       }
       if (loadConfig().discordRpc !== false) {
         rpc.setIdle(account.name);

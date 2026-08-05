@@ -1,18 +1,79 @@
+/* Вся палитра — переменные: тема из настроек пересчитывает их целиком,
+   поэтому зашитых цветов в стилях быть не должно (иначе часть блоков
+   останется от старой темы, как было с полями ввода и карточками). */
 :root {
   --navy: #1a0a2e;
   --navy-deep: #0f0518;
   --card: #1c1030;
   --card-2: #241640;
+  --input-bg: #130a24;
+  --deep: #0a0414;
   --accent: #a855f7;
   --accent-hover: #9333ea;
   --accent-glow: rgba(168, 85, 247, 0.35);
+  --accent-glow-strong: rgba(168, 85, 247, 0.7);
+  --accent-soft: rgba(168, 85, 247, 0.18);
   --text: #f3e8ff;
   --text-dim: #b9a6d6;
+  --hint: #8a78ad;
+  --log-text: #c9b8e6;
   --border: rgba(168, 85, 247, 0.25);
+  --hover-veil: rgba(255, 255, 255, 0.07);
+  --overlay: rgba(8, 3, 16, 0.72);
+  --on-accent: #ffffff;
   --danger: #ef4444;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── Иконки (SVG-спрайт вместо эмодзи) ── */
+.icon-sprite { display: none; }
+.ic {
+  width: 1.15em; height: 1.15em; flex-shrink: 0; vertical-align: -0.2em;
+  fill: none; stroke: currentColor; stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* ── Фон окна: картинка или видео ──
+   Слой лежит НАД фоном body (z-index 0), а интерфейс — над ним (z-index 1).
+   Отрицательный z-index не годился: фон body непрозрачен и перекрывал слой,
+   из-за чего картинка не появлялась вовсе.
+   Масштаб и положение — как в редакторе баннера: object-fit + object-position
+   даёт кадрирование, transform: scale — приближение. */
+/* Размеры и положение медиа считает JS (см. layoutBg): только так кадр
+   двигается ровно за курсором и не оставляет щелей по краям. */
+#bg-media { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+#bg-media img, #bg-media video { position: absolute; max-width: none; }
+#bg-veil { position: absolute; inset: 0; background: var(--bg-veil, transparent); }
+main, .footer { position: relative; z-index: 1; }
+/* Шапка ВЫШЕ контента: из неё выпадает меню аккаунта («Сменить аккаунт» /
+   «Выйти»). При равном z-index main шёл позже в DOM и ложился поверх меню —
+   меню было видно (main прозрачный), но клики забирал он, и кнопки молчали. */
+.titlebar { position: relative; z-index: 30; }
+
+/* Превью кадра — точная копия окна в масштабе: что здесь видно, то и будет */
+/* Пропорции окна лаунчера — что видно здесь, то и будет на фоне.
+   Задаём высоту, ширину считает aspect-ratio: иначе превью на всю ширину
+   модалки выталкивало ползунки за нижний край. */
+.bg-preview {
+  position: relative; height: 132px; aspect-ratio: 3 / 2; width: auto; margin: 2px auto 0;
+  border-radius: 10px; overflow: hidden; background: var(--deep);
+  border: 1px solid var(--border); cursor: grab; user-select: none;
+}
+.bg-preview.dragging { cursor: grabbing; }
+.bg-preview img, .bg-preview video { position: absolute; max-width: none; -webkit-user-drag: none; }
+/* Подсказка не занимает место постоянно — всплывает при наведении */
+.bg-preview-hint {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 5px 8px;
+  font-size: 10px; color: #fff; background: rgba(0, 0, 0, .55); text-align: center;
+  pointer-events: none; opacity: 0; transition: opacity .18s;
+}
+.bg-preview:hover .bg-preview-hint { opacity: 1; }
+.bg-preview.dragging .bg-preview-hint { opacity: 0; }
+.bg-row { display: flex; align-items: center; gap: 10px; }
+.bg-row .label { flex-shrink: 0; }
+.bg-row input[type=range] { flex: 1; }
+.bg-row .btn-secondary { height: 28px; font-size: 11px; }
 
 /* hidden-атрибут должен побеждать любые display из стилей */
 [hidden] { display: none !important; }
@@ -30,8 +91,11 @@ body {
   display: flex;
   flex-direction: column;
   background:
-    radial-gradient(900px 500px at 50% -10%, rgba(168, 85, 247, 0.18), transparent 70%),
+    linear-gradient(var(--bg-veil, transparent), var(--bg-veil, transparent)),
+    var(--bg-image, none) center / cover no-repeat,
+    radial-gradient(900px 500px at 50% -10%, var(--accent-soft), transparent 70%),
     var(--navy-deep);
+  transition: background-color .2s;
 }
 
 /* ── Titlebar ── */
@@ -43,7 +107,7 @@ body {
   padding: 0 6px 0 16px;
   -webkit-app-region: drag;
   position: relative;
-  border-bottom: 1px solid rgba(168, 85, 247, 0.12);
+  border-bottom: 1px solid var(--border);
 }
 .titlebar-drag { display: flex; align-items: baseline; gap: 8px; }
 .logo { font-weight: 800; letter-spacing: 2px; color: var(--accent); font-size: 14px; }
@@ -56,16 +120,16 @@ body {
 .tab {
   padding: 7px 18px; border: 0; border-radius: 9px; cursor: pointer;
   background: transparent; color: var(--text-dim); font-size: 13px; font-weight: 600;
-  transition: all .15s;
+  transition: color .15s, background-color .15s, border-color .15s, box-shadow .15s;
 }
-.tab:hover { color: var(--text); background: rgba(255,255,255,0.05); }
-.tab.active { color: #fff; background: linear-gradient(180deg, var(--accent), var(--accent-hover));
+.tab:hover { color: var(--text); background: var(--hover-veil); }
+.tab.active { color: var(--on-accent); background: linear-gradient(180deg, var(--accent), var(--accent-hover));
   box-shadow: 0 4px 14px var(--accent-glow); }
 
 /* Аккаунт в шапке (как у CurseForge): чип со скином, меню по клику */
 .btn-header-login {
   height: 30px; padding: 0 16px; border: 1px solid var(--border); border-radius: 9px;
-  background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff;
+  background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: var(--on-accent);
   font-size: 12px; font-weight: 700; cursor: pointer; box-shadow: 0 3px 12px var(--accent-glow);
 }
 .btn-header-login:hover { filter: brightness(1.1); }
@@ -78,7 +142,7 @@ body {
 .acc-avatar { width: 22px; height: 22px; border-radius: 5px; image-rendering: pixelated; }
 .acc-avatar-fallback {
   width: 22px; height: 22px; border-radius: 5px; background: var(--accent);
-  color: #fff; font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center;
+  color: var(--on-accent); font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center;
 }
 .acc-chip-text { display: flex; flex-direction: column; line-height: 1.1; }
 .acc-chip-name { font-size: 12px; font-weight: 700; color: var(--text); }
@@ -93,15 +157,15 @@ body {
   text-align: left; padding: 8px 11px; border: 0; border-radius: 7px; cursor: pointer;
   background: transparent; color: var(--text); font-size: 12px;
 }
-.acc-menu-item:hover { background: rgba(255,255,255,0.07); }
+.acc-menu-item:hover { background: var(--hover-veil); }
 .acc-menu-danger { color: #fca5a5; }
 .acc-menu-danger:hover { background: rgba(239,68,68,0.15); }
 .winbtn {
   width: 34px; height: 28px; border: 0; background: transparent; color: var(--text-dim);
   font-size: 13px; cursor: pointer; border-radius: 6px;
 }
-.winbtn:hover { background: rgba(255,255,255,0.08); color: var(--text); }
-.winbtn-close:hover { background: var(--danger); color: #fff; }
+.winbtn:hover { background: var(--hover-veil); color: var(--text); }
+.winbtn-close:hover { background: var(--danger); color: var(--on-accent); }
 
 main { flex: 1; min-height: 0; padding: 8px 28px 18px; display: flex; flex-direction: column; gap: 14px; }
 
@@ -123,10 +187,10 @@ main { flex: 1; min-height: 0; padding: 8px 28px 18px; display: flex; flex-direc
 }
 .field { display: flex; flex-direction: column; gap: 5px; }
 .label { font-size: 12px; color: var(--text-dim); }
-.hint { font-size: 11px; color: #8a78ad; }
+.hint { font-size: 11px; color: var(--hint); }
 
 input[type=text] {
-  background: #130a24; border: 1px solid var(--border); color: var(--text);
+  background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
   border-radius: 9px; padding: 10px 12px; font-size: 14px; outline: none;
   transition: border-color .15s, box-shadow .15s;
 }
@@ -148,14 +212,14 @@ input[readonly] { color: var(--text-dim); }
 .segmented { display: flex; gap: 6px; }
 .seg {
   flex: 1; padding: 9px 0; border-radius: 9px; cursor: pointer; font-size: 13px; font-weight: 600;
-  background: #130a24; color: var(--text-dim); border: 1px solid var(--border); transition: all .15s;
+  background: var(--input-bg); color: var(--text-dim); border: 1px solid var(--border); transition: color .15s, background-color .15s, border-color .15s, box-shadow .15s;
 }
 .seg:hover { color: var(--text); }
-.seg.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff; border-color: transparent; box-shadow: 0 4px 16px var(--accent-glow); }
+.seg.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: var(--on-accent); border-color: transparent; box-shadow: 0 4px 16px var(--accent-glow); }
 
 /* Range */
 input[type=range] { -webkit-appearance: none; width: 100%; height: 6px; border-radius: 6px;
-  background: #130a24; border: 1px solid var(--border); outline: none; }
+  background: var(--input-bg); border: 1px solid var(--border); outline: none; }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
   background: var(--accent); cursor: pointer; box-shadow: 0 0 10px var(--accent-glow); }
 
@@ -171,7 +235,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .advanced[open] summary::before { content: "▾ "; }
 .advanced { margin-top: -2px; }
 .advanced .field { margin-top: 10px; }
-.btn-secondary { background: #130a24; border: 1px solid var(--border); color: var(--text-dim);
+.btn-secondary { background: var(--input-bg); border: 1px solid var(--border); color: var(--text-dim);
   border-radius: 9px; padding: 0 14px; cursor: pointer; font-size: 12px; }
 .btn-secondary:hover { color: var(--text); border-color: var(--accent); }
 
@@ -179,7 +243,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .btn-ms {
   display: inline-flex; align-items: center; justify-content: center; gap: 9px;
   height: 42px; padding: 0 18px; border: 0; border-radius: 9px; cursor: pointer;
-  background: #2f2f2f; color: #fff; font-size: 14px; font-weight: 600; align-self: flex-start;
+  background: #2f2f2f; color: var(--on-accent); font-size: 14px; font-weight: 600; align-self: flex-start;
 }
 .btn-ms::before {
   content: ""; width: 16px; height: 16px; flex-shrink: 0;
@@ -199,7 +263,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .launch-area { display: flex; align-items: center; gap: 16px; margin-top: auto; }
 .progress-wrap { flex: 1; display: flex; flex-direction: column; gap: 7px; }
 .status { font-size: 12px; color: var(--text-dim); min-height: 15px; }
-.progress { height: 8px; background: #130a24; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+.progress { height: 8px; background: var(--input-bg); border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
 .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), #d8b4fe);
   border-radius: 6px; transition: width .2s ease; }
 .progress-bar.indeterminate { width: 40% !important; animation: slide 1.1s infinite ease-in-out; }
@@ -207,7 +271,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 
 .btn-play {
   padding: 0 34px; height: 54px; border: 0; border-radius: 12px; cursor: pointer;
-  font-size: 18px; font-weight: 800; letter-spacing: 2px; color: #fff;
+  font-size: 18px; font-weight: 800; letter-spacing: 2px; color: var(--on-accent);
   background: linear-gradient(180deg, var(--accent), var(--accent-hover));
   box-shadow: 0 8px 24px var(--accent-glow); transition: transform .1s, filter .15s;
 }
@@ -217,15 +281,15 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 
 /* ── Log ── */
 .logbox {
-  height: 120px; overflow-y: auto; background: #0a0414; border: 1px solid var(--border);
+  height: 120px; overflow-y: auto; background: var(--deep); border: 1px solid var(--border);
   border-radius: 10px; padding: 8px 10px; font-family: Consolas, monospace; font-size: 11px;
-  color: #c9b8e6; white-space: pre-wrap; word-break: break-word; user-select: text;
+  color: var(--log-text); white-space: pre-wrap; word-break: break-word; user-select: text;
 }
 
 /* ── Кнопки-акценты и модалка входа ── */
 .btn-accent {
   height: 40px; padding: 0 18px; border: 0; border-radius: 9px; cursor: pointer;
-  background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff;
+  background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: var(--on-accent);
   font-size: 13px; font-weight: 700; box-shadow: 0 4px 14px var(--accent-glow);
   transition: filter .15s;
 }
@@ -234,7 +298,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 
 .overlay {
   position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center;
-  background: rgba(8, 3, 16, 0.72); backdrop-filter: blur(4px);
+  background: var(--overlay); backdrop-filter: blur(4px);
 }
 .modal {
   width: 400px; background: linear-gradient(180deg, var(--card-2), var(--card));
@@ -260,10 +324,10 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .content-types { display: flex; gap: 6px; }
 .ctype {
   padding: 6px 16px; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600;
-  background: #130a24; color: var(--text-dim); border: 1px solid var(--border); transition: all .15s;
+  background: var(--input-bg); color: var(--text-dim); border: 1px solid var(--border); transition: color .15s, background-color .15s, border-color .15s, box-shadow .15s;
 }
 .ctype:hover { color: var(--text); }
-.ctype.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff;
+.ctype.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: var(--on-accent);
   border-color: transparent; box-shadow: 0 3px 12px var(--accent-glow); }
 /* Шапка вкладки: чипы типов и поиск в одной строке — раньше шапка занимала
    четыре ряда и отъедала высоту у самого списка */
@@ -278,17 +342,168 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .seg-mini { display: flex; gap: 4px; flex-shrink: 0; }
 .segm {
   padding: 5px 12px; border-radius: 8px; cursor: pointer; font-size: 11px; font-weight: 600;
-  background: #130a24; color: var(--text-dim); border: 1px solid var(--border);
+  background: var(--input-bg); color: var(--text-dim); border: 1px solid var(--border);
 }
 .segm:hover { color: var(--text); }
-.segm.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff;
+.segm.active { background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: var(--on-accent);
   border-color: transparent; box-shadow: 0 3px 12px var(--accent-glow); }
+
+/* ── Косметика ── */
+#view-cosmetics { gap: 12px; }
+.cosm-head { display: flex; align-items: center; gap: 14px; }
+.wallet {
+  display: flex; align-items: baseline; gap: 8px; padding: 7px 14px; border-radius: 11px;
+  background: linear-gradient(180deg, var(--card), var(--navy)); border: 1px solid var(--border);
+}
+.wallet-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+.wallet-value { font-size: 18px; font-weight: 800; color: var(--accent); }
+.cosm-head .hint { flex: 1; min-width: 0; }
+
+.cosm-grid {
+  flex: 1; min-height: 0; overflow-y: auto; padding-right: 4px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+/* Витрина сгруппирована по слотам: в каждом надета ровно одна вещь */
+.cosm-slot-title {
+  font-size: 12px; font-weight: 700; color: var(--text-dim);
+  letter-spacing: .5px; text-transform: uppercase; margin: 10px 0 2px;
+}
+.cosm-slot-title:first-child { margin-top: 0; }
+.cosm-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+.cosm-grid::-webkit-scrollbar { width: 8px; }
+.cosm-grid::-webkit-scrollbar-thumb { background: var(--card-2); border-radius: 6px; }
+
+.cosm-card {
+  display: flex; flex-direction: column; gap: 5px; padding: 14px 14px 12px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 13px;
+  animation: fadeUp .18s ease both; transition: border-color .15s, transform .12s;
+}
+.cosm-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+/* Витрина в две колонки: слева примерочная, справа список.
+   Косметику выбирают глазами, поэтому вещь на персонаже видна всегда. */
+/* Витрина занимает всю оставшуюся высоту, а список внутри неё листается.
+   Без min-height:0 флекс не даёт колонке сжаться и прокрутка не появляется. */
+#view-cosmetics { gap: 10px; }
+.cosm-layout { display: flex; gap: 16px; align-items: stretch; flex: 1; min-height: 0; }
+.cosm-scroll { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; padding-right: 4px; }
+.cosm-scroll::-webkit-scrollbar { width: 8px; }
+.cosm-scroll::-webkit-scrollbar-thumb { background: var(--card-2); border-radius: 6px; }
+.cosm-scroll::-webkit-scrollbar-thumb:hover { background: var(--accent-hover); }
+.cosm-skin { display: flex; flex-direction: column; gap: 8px; max-width: 460px; }
+.skin-model-row { margin-top: 2px; }
+.cosm-fitting {
+  width: 230px; flex: none; align-self: flex-start;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 12px 10px 14px; border-radius: 14px;
+  background: var(--card); border: 1px solid var(--border);
+}
+.cosm-view {
+  width: 100%; height: 290px; cursor: grab; touch-action: none;
+  background: radial-gradient(circle at 50% 38%, var(--card-2), var(--deep) 72%);
+  border-radius: 10px;
+}
+.cosm-view:active { cursor: grabbing; }
+.cosm-view-name { font-size: 13px; color: var(--text); margin-top: 6px; text-align: center; }
+.cosm-view-hint { font-size: 11px; color: var(--hint); }
+
+.cosm-card { cursor: pointer; }
+.cosm-card.is-picked { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft); }
+.cosm-preview {
+  height: 82px; border-radius: 10px; background: var(--deep);
+  display: flex; align-items: center; justify-content: center; margin-bottom: 4px;
+}
+.cosm-thumb { width: 82px; height: 82px; image-rendering: pixelated; }
+.cosm-dot {
+  width: 15px; height: 15px; border-radius: 50%; background: var(--dot);
+  box-shadow: 0 0 14px 3px var(--dot); animation: dotPulse 2.2s ease-in-out infinite;
+}
+@keyframes dotPulse { 0%, 100% { transform: scale(1); opacity: .95; } 50% { transform: scale(1.18); opacity: 1; } }
+.cosm-dot-rainbow { animation: dotPulse 2.2s ease-in-out infinite, dotHue 4s linear infinite; }
+@keyframes dotHue { from { filter: hue-rotate(0deg); } to { filter: hue-rotate(360deg); } }
+.cosm-dot-rainbow { background: #ff4d4d; box-shadow: 0 0 14px 3px #ff4d4d; }
+.cosm-name { font-size: 13px; font-weight: 700; }
+.cosm-desc { font-size: 11px; color: var(--text-dim); line-height: 1.4; flex: 1; }
+/* Название можно скопировать одним кликом — чтобы не выписывать вручную,
+   какая вещь сидит криво. */
+.cosm-copy { cursor: copy; }
+.cosm-copy:hover { color: var(--accent); }
+.cosm-copy.is-copied { color: #b9f6ca; }
+.cosm-state { font-size: 11px; color: var(--hint); margin-top: 4px; }
+.cosm-state.is-warn { color: var(--danger); }
+.cosm-foot { display: flex; gap: 7px; margin-top: 8px; }
+.cosm-btn { height: 30px; padding: 0 12px; font-size: 12px; flex: 1; }
+
+/* ── Редактор плаща и флага ── */
+/* Слева холст, справа палитра и предпросмотр: так видно и что рисуешь,
+   и как это сядет на игрока, без переключения вкладок. */
+/* потолок по высоте — страховка на случай очень низкого окна */
+.modal-draw { width: 640px; max-height: calc(100vh - 30px); overflow-y: auto; }
+.draw-body { display: flex; gap: 18px; align-items: flex-start; }
+.draw-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.draw-right { display: flex; flex-direction: column; gap: 7px; width: 190px; flex: none; }
+.draw-canvas {
+  border: 1px solid var(--border); border-radius: 8px; background: var(--deep);
+  image-rendering: pixelated; cursor: crosshair; touch-action: none; max-width: 100%;
+}
+.draw-tools { display: flex; gap: 6px; align-items: center; }
+.draw-tool {
+  width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+  background: var(--card-2); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text-dim); cursor: pointer; transition: border-color .15s, color .15s;
+}
+.draw-tool:hover { color: var(--text); border-color: var(--accent); }
+.draw-tool.is-on { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+.draw-sep { width: 1px; height: 20px; background: var(--border); margin: 0 2px; }
+.draw-palette { display: grid; grid-template-columns: repeat(6, 1fr); gap: 5px; }
+.draw-swatch {
+  aspect-ratio: 1; border-radius: 6px; border: 1px solid rgba(255, 255, 255, .14);
+  cursor: pointer; padding: 0; transition: transform .12s, box-shadow .12s;
+}
+.draw-swatch:hover { transform: scale(1.12); }
+.draw-swatch.is-on { box-shadow: 0 0 0 2px var(--accent); }
+.draw-color-row { align-items: center; gap: 8px; }
+.draw-color-row input[type="color"] {
+  width: 42px; height: 26px; padding: 0; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--input-bg); cursor: pointer;
+}
+.draw-preview {
+  width: 100%; height: 210px; border: 1px solid var(--border); border-radius: 8px;
+  background: radial-gradient(circle at 50% 38%, var(--card-2), var(--deep) 72%);
+  cursor: grab; touch-action: none;
+}
+.draw-preview:active { cursor: grabbing; }
+.draw-actions { display: flex; gap: 7px; margin-top: 2px; }
+.draw-actions button { flex: 1; height: 32px; font-size: 12px; padding: 0 10px; }
+
+/* ── Настройки лаунчера ── */
+/* Две колонки под цвета: в один столбец окно настроек не влезало по высоте */
+.modal-settings { width: 580px; max-height: calc(100vh - 50px); overflow-y: auto; gap: 12px; }
+.settings-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.settings-cols .modal-block { min-width: 0; }
+.modal-settings::-webkit-scrollbar { width: 8px; }
+.modal-settings::-webkit-scrollbar-thumb { background: var(--card-2); border-radius: 6px; }
+.swatches { display: flex; gap: 7px; flex-wrap: wrap; }
+.swatch {
+  width: 26px; height: 26px; border-radius: 8px; cursor: pointer; padding: 0;
+  border: 2px solid transparent; transition: transform .12s, border-color .12s;
+}
+.swatch:hover { transform: translateY(-2px); }
+.swatch.active { border-color: var(--text); box-shadow: 0 0 0 2px rgba(0,0,0,.4); }
+/* flex:0 0 — иначе .row-inline растягивает поле цвета во всю строку */
+input[type=color] {
+  flex: 0 0 46px; width: 46px; height: 38px; padding: 3px; cursor: pointer;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: 9px;
+}
+input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+input[type=color]::-webkit-color-swatch { border: 0; border-radius: 6px; }
+#accent-hex, #bg-hex { flex: 1; min-width: 0; font-family: Consolas, monospace; text-transform: uppercase; }
+.modal-settings .btn-secondary { height: 36px; display: inline-flex; align-items: center; gap: 7px; }
 
 /* Галочки «что положить в код» / «что взять из кода» */
 .share-parts { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
 .share-parts .checkbox { font-size: 12px; align-items: flex-start; }
 .share-parts .checkbox input { margin-top: 1px; }
-.share-parts i { display: block; font-style: normal; font-size: 10px; color: #8a78ad; }
+.share-parts i { display: block; font-style: normal; font-size: 10px; color: var(--hint); }
 
 /* Код сборки — главное содержимое своей модалки, поэтому крупно и вразрядку */
 #build-code {
@@ -304,12 +519,12 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .vote-btn {
   display: inline-flex; align-items: center; gap: 5px; height: 32px; padding: 0 12px;
   border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600;
-  background: #130a24; color: var(--text-dim); border: 1px solid var(--border);
+  background: var(--input-bg); color: var(--text-dim); border: 1px solid var(--border);
 }
 .vote-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
 .vote-btn:disabled { opacity: .5; cursor: default; }
 .vote-btn.voted { background: linear-gradient(180deg, var(--accent), var(--accent-hover));
-  color: #fff; border-color: transparent; box-shadow: 0 3px 12px var(--accent-glow); }
+  color: var(--on-accent); border-color: transparent; box-shadow: 0 3px 12px var(--accent-glow); }
 .mod-votes { color: var(--text); }
 
 .mods-search { display: flex; gap: 8px; }
@@ -338,7 +553,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .mod-row.mod-foreign { opacity: .45; border-style: dashed; }
 .mod-icon {
   width: 38px; height: 38px; border-radius: 8px; overflow: hidden; flex-shrink: 0;
-  background: #130a24; display: flex; align-items: center; justify-content: center;
+  background: var(--input-bg); display: flex; align-items: center; justify-content: center;
   color: var(--accent); font-weight: 800; font-size: 16px;
 }
 .mod-icon img { width: 100%; height: 100%; object-fit: cover; }
@@ -346,7 +561,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .mod-title { font-size: 13px; font-weight: 700; color: var(--text);
   display: flex; align-items: center; gap: 8px; }
 .mod-dl { font-size: 10px; font-weight: 600; color: var(--text-dim);
-  background: #130a24; border-radius: 6px; padding: 1px 7px; }
+  background: var(--input-bg); border-radius: 6px; padding: 1px 7px; }
 .mod-sub { font-size: 11px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mod-controls { display: flex; align-items: center; gap: 9px; flex-shrink: 0; }
 .btn-install { height: 32px; padding: 0 14px; font-size: 12px; }
@@ -360,7 +575,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .switch { position: relative; width: 40px; height: 22px; flex-shrink: 0; cursor: pointer; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .slider {
-  position: absolute; inset: 0; border-radius: 22px; background: #130a24;
+  position: absolute; inset: 0; border-radius: 22px; background: var(--input-bg);
   border: 1px solid var(--border); transition: background .18s, border-color .18s;
 }
 .slider::before {
@@ -386,13 +601,13 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .footer-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .btn-update {
   margin-left: auto; padding: 4px 12px; border: 0; border-radius: 8px; cursor: pointer;
-  background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: #fff;
+  background: linear-gradient(180deg, var(--accent), var(--accent-hover)); color: var(--on-accent);
   font-size: 11px; font-weight: 700; box-shadow: 0 3px 10px var(--accent-glow);
   animation: pulse 2s infinite;
 }
 .btn-update:hover { filter: brightness(1.1); }
 .btn-update + .link { margin-left: 8px; }
-@keyframes pulse { 0%, 100% { box-shadow: 0 3px 10px var(--accent-glow); } 50% { box-shadow: 0 3px 18px rgba(168, 85, 247, 0.7); } }
+@keyframes pulse { 0%, 100% { box-shadow: 0 3px 10px var(--accent-glow); } 50% { box-shadow: 0 3px 18px var(--accent-glow-strong); } }
 
 /* ── Модалка мода (карточка как на Modrinth) ── */
 .mod-row.clickable { cursor: pointer; }
@@ -410,9 +625,9 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .mod-modal-scroll::-webkit-scrollbar-thumb { background: var(--card-2); border-radius: 6px; }
 .mod-modal-scroll::-webkit-scrollbar-thumb:hover { background: var(--accent-hover); }
 
-.mod-gallery { position: relative; border-radius: 12px; overflow: hidden; background: #0a0414;
+.mod-gallery { position: relative; border-radius: 12px; overflow: hidden; background: var(--deep);
   border: 1px solid var(--border); flex-shrink: 0; }
-.mod-gallery img { display: block; width: 100%; height: 280px; object-fit: contain; background: #0a0414; }
+.mod-gallery img { display: block; width: 100%; height: 280px; object-fit: contain; background: var(--deep); }
 .gal-nav {
   position: absolute; top: 50%; transform: translateY(-50%); width: 34px; height: 48px;
   border: 0; border-radius: 10px; cursor: pointer; font-size: 22px; line-height: 1;
@@ -435,9 +650,9 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .md .md-h3 { font-size: 13px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
 .md a { color: var(--accent); text-decoration: none; }
 .md a:hover { text-decoration: underline; }
-.md code { background: #130a24; border: 1px solid var(--border); border-radius: 5px;
+.md code { background: var(--input-bg); border: 1px solid var(--border); border-radius: 5px;
   padding: 1px 5px; font-family: Consolas, monospace; font-size: 12px; }
-.md pre { background: #0a0414; border: 1px solid var(--border); border-radius: 9px;
+.md pre { background: var(--deep); border: 1px solid var(--border); border-radius: 9px;
   padding: 9px 11px; margin: 0 0 9px; font-family: Consolas, monospace; font-size: 12px;
   white-space: pre-wrap; word-break: break-word; }
 .md ul { margin: 0 0 9px; padding-left: 20px; }
@@ -457,15 +672,15 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 /* ── Перенос из другого лаунчера ── */
 #migrate-source {
   flex: 1; min-width: 0;
-  background: #130a24; border: 1px solid var(--border); color: var(--text);
+  background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
   border-radius: 9px; padding: 10px 12px; font-size: 13px; outline: none;
 }
 #migrate-source:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
 #btn-migrate { margin-top: 10px; }
 .migrate-results {
   margin-top: 10px; padding: 10px 12px; border-radius: 9px;
-  background: #130a24; border: 1px solid var(--border);
-  font-size: 12px; color: #c9b8e6; white-space: pre-wrap; word-break: break-word;
+  background: var(--input-bg); border: 1px solid var(--border);
+  font-size: 12px; color: var(--log-text); white-space: pre-wrap; word-break: break-word;
   max-height: 160px; overflow-y: auto; user-select: text;
 }
 
@@ -513,6 +728,12 @@ input[type=text], #migrate-source { transition: border-color .15s, box-shadow .1
 .mod-row { transition: border-color .15s, opacity .15s, transform .12s, box-shadow .15s; }
 .mod-row.clickable:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3); }
 
+/* Пока тянут палитру, переходы выключены: иначе каждая кнопка на каждое
+   движение мыши перезапускает анимацию цвета — интерфейс начинает лагать */
+body.theme-live *, body.theme-live *::before, body.theme-live *::after {
+  transition: none !important;
+}
+
 /* системная настройка «меньше движения» отключает всё разом */
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
@@ -531,7 +752,7 @@ input[type=text], #migrate-source { transition: border-color .15s, box-shadow .1
 .mig-card {
   position: relative; display: flex; flex-direction: column; gap: 3px;
   padding: 10px 11px 9px; border-radius: 11px; cursor: pointer;
-  background: #130a24; border: 1px solid var(--border);
+  background: var(--input-bg); border: 1px solid var(--border);
   transition: border-color .12s, box-shadow .12s, transform .12s, opacity .12s;
 }
 .mig-card:hover { transform: translateY(-1px); border-color: var(--accent); }
@@ -542,10 +763,49 @@ input[type=text], #migrate-source { transition: border-color .15s, box-shadow .1
 .mig-card:has(input:checked) {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent), 0 4px 14px var(--accent-glow);
-  background: linear-gradient(180deg, rgba(168,85,247,.16), rgba(168,85,247,.06)), #130a24;
+  background: linear-gradient(180deg, rgba(168,85,247,.16), rgba(168,85,247,.06)), var(--input-bg);
 }
 .mig-card:has(input:checked)::after {
   content: "✓"; position: absolute; top: 6px; right: 8px;
   font-size: 11px; font-weight: 800; color: var(--accent);
 }
 .mig-card:not(:has(input:checked)) { opacity: .55; }
+
+/* ── настройка блоков интерфейса (прозрачность/положение) ─────────────── */
+body.blocks-edit .ui-block {
+  outline: 2px dashed var(--accent);
+  outline-offset: 3px;
+  cursor: move;
+  position: relative;
+}
+/* внутренности не перехватывают мышь — тянется весь блок целиком */
+body.blocks-edit .ui-block * { pointer-events: none; }
+body.blocks-edit .ui-block::after {
+  content: attr(data-block-name);
+  position: absolute;
+  top: -12px;
+  left: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--on-accent);
+  pointer-events: none;
+  z-index: 5;
+}
+.blocks-edit-bar {
+  position: fixed;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card-2);
+  color: var(--text);
+  z-index: 900;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+}
