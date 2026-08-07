@@ -136,6 +136,7 @@ const CURATED = {
     { slug: 'patpat', ru: 'Гладь игроков и питомцев по голове (ПКМ + shift)' },
     { slug: 'online-patpat', ru: 'PatPat работает с другими игроками на сервере' },
     { slug: 'zoomify', ru: 'Зум на клавишу, как в OptiFine' },
+    { slug: 'cameraoverhaul', ru: 'Плавные наклоны камеры при движении — приятнее ощущается игра' },
     { slug: 'appleskin', ru: 'Показывает сытость и питательность еды' },
     { slug: 'mouse-tweaks', ru: 'Удобное перетаскивание предметов мышью' },
     { slug: 'shulkerboxtooltip', ru: 'Содержимое шалкера видно прямо в подсказке' },
