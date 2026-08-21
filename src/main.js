@@ -41,15 +41,57 @@ process.on('uncaughtException', (err) => {
 });
 process.on('unhandledRejection', (err) => filelog.crash('Промис без catch', err));
 app.on('render-process-gone', (_e, _wc, details) => filelog.crash('Упал процесс окна (render-process-gone)', details));
+let gpuCrashes = 0;
 app.on('child-process-gone', (_e, details) => {
   // GPU-процесс на битых видеодрайверах умирает молча — это главный
   // подозреваемый в «окно мелькнуло и закрылось». reason=clean-exit — норма.
-  if (details && details.reason !== 'clean-exit') filelog.crash('Упал служебный процесс (' + (details.type || '?') + ')', details);
+  if (details && details.reason !== 'clean-exit') {
+    filelog.crash('Упал служебный процесс (' + (details.type || '?') + ')', details);
+    if (details.type === 'GPU' && ++gpuCrashes >= 2) enterGpuFallback('GPU-процесс упал ' + gpuCrashes + ' раза');
+  }
 });
 
 // На Linux при распаковке из архива chrome-sandbox не получает setuid-root →
 // стандартный sandbox падает. Отключаем его (безопасно для лаунчера в домашней папке).
-if (process.platform === 'linux') app.commandLine.appendSwitch('no-sandbox');
+// Там же — «чёрное окно»: на части систем (NVIDIA+Wayland, виртуалки, старые Mesa)
+// GPU-композитинг отдаёт пустой кадр либо GPU-процесс падает. Лечится программным
+// рендером; включаем его по маркеру от прошлого неудачного запуска (см.
+// scheduleBlackFrameCheck) или флагом --safe-gpu. Сброс маркера: --reset-gpu.
+const GPU_MARKER = path.join(app.getPath('userData'), 'gpu-fallback');
+let gpuFallback = false;
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('no-sandbox');
+  // Seccomp-фильтр Chromium на части систем возвращает мусорные errno (ESRCH,
+  // «No such process») на shared memory: «невозможные» ошибки /dev/shm при
+  // честных правах 1777 и FATAL до первого кадра (кейс 17.08, лечение
+  // подтверждено игроком). Песочница и так выключена — снимаем и seccomp-слой.
+  app.commandLine.appendSwitch('disable-seccomp-filter-sandbox');
+  // /dev/shm недоступен (кейс 17.08: access(W_OK|X_OK) → FATAL, до того — чёрное
+  // окно): Chromium гоняет кадры рендерера через shared memory. Переводим shmem
+  // на файлы в /tmp — тот же приём, каким лечат Chromium в докере.
+  try { fs.accessSync('/dev/shm', fs.constants.W_OK | fs.constants.X_OK); }
+  catch (_) {
+    app.commandLine.appendSwitch('disable-dev-shm-usage');
+    filelog.line('/dev/shm недоступен — включаю disable-dev-shm-usage');
+  }
+  if (process.argv.includes('--reset-gpu')) { try { fs.unlinkSync(GPU_MARKER); } catch (_) {} }
+  gpuFallback = process.argv.includes('--safe-gpu') || fs.existsSync(GPU_MARKER);
+  if (gpuFallback) {
+    app.disableHardwareAcceleration();
+    filelog.line('GPU: программный рендер (маркер gpu-fallback / --safe-gpu)');
+  }
+}
+
+// Единственный перезапуск в программный рендер. Повторно не срабатывает:
+// если чёрное окно и в фолбэке — дело не в GPU, разбираемся по логу.
+function enterGpuFallback(why) {
+  if (gpuFallback || process.platform !== 'linux') return;
+  gpuFallback = true;
+  filelog.line('GPU: ' + why + ' — перезапуск в программном рендере');
+  try { fs.writeFileSync(GPU_MARKER, why + '\n'); } catch (_) {}
+  app.relaunch();
+  app.exit(0);
+}
 
 // Свой протокол для фона окна. Через него отдаём картинку/видео из папки
 // настроек: renderer не имеет доступа к file://, а гнать видео в base64 —
@@ -270,6 +312,31 @@ function resolveAccount(cfg) {
 // ─── Окно ─────────────────────────────────────────────────────────────
 let mainWindow = null;
 
+// Процесс запущенной игры. Пока он жив, лаунчер можно «закрыть» отдельно от
+// Minecraft: окно исчезает, а сам процесс остаётся ждать выхода игры в фоне
+// (лог, Discord RPC и авто-починка модов продолжают работать) и завершается
+// сам, как только игра закрылась.
+let gameProc = null;
+function gameRunning() { return !!(gameProc && gameProc.exitCode === null && !gameProc.killed); }
+
+// Один экземпляр: лаунчер умеет жить в фоне без окна (см. выше), поэтому
+// повторный запуск exe не плодит второй процесс, а будит первый — тот заново
+// открывает окно.
+if (!app.requestSingleInstanceLock()) {
+  filelog.line('Лаунчер уже запущен — бужу его окно и выхожу.');
+  app.exit(0);
+}
+app.on('second-instance', () => {
+  app.whenReady().then(() => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow();
+    } else {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+});
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 960,
@@ -288,7 +355,15 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
-  mainWindow.webContents.on('did-finish-load', () => filelog.line('окно загружено'));
+  mainWindow.webContents.on('did-finish-load', () => {
+    filelog.line('окно загружено');
+    scheduleBlackFrameCheck();
+    // окно могли открыть заново, пока игра работает в фоне — покажем это сразу
+    if (gameRunning()) {
+      send('state', { state: 'running' });
+      send('status', 'Игра запущена');
+    }
+  });
   mainWindow.webContents.on('did-fail-load', (_e, code, desc) =>
     filelog.crash('Окно не загрузилось', { code, desc }));
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -309,6 +384,29 @@ function createWindow() {
     });
   }
   // mainWindow.webContents.openDevTools({ mode: 'detach' });
+}
+
+// Детектор «чёрного окна» (Linux): через 4с после загрузки снимаем кадр и ищем
+// хоть несколько пикселей заметно ярче фона #0f0518. В UI всегда есть светлый
+// текст и кнопки, поэтому полностью тёмный кадр = GPU не отрисовал страницу →
+// уходим в программный рендер через enterGpuFallback.
+function scheduleBlackFrameCheck() {
+  if (process.platform !== 'linux' || gpuFallback) return;
+  setTimeout(async () => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (!mainWindow.isVisible() || mainWindow.isMinimized()) return; // кадр свёрнутого окна пуст — не повод
+      const img = await mainWindow.webContents.capturePage();
+      const { width, height } = img.getSize();
+      if (!width || !height) return;
+      const buf = img.getBitmap(); // BGRA
+      let bright = 0;
+      for (let i = 0; i < buf.length; i += 4 * 16) { // каждый 16-й пиксель
+        if (buf[i] > 80 || buf[i + 1] > 80 || buf[i + 2] > 80) { if (++bright > 8) return; }
+      }
+      enterGpuFallback('окно загрузилось, но кадр полностью чёрный');
+    } catch (_) {}
+  }, 4000);
 }
 
 // ─── Автообновление ───────────────────────────────────────────────────
@@ -385,7 +483,13 @@ app.whenReady().then(() => {
   }
 });
 app.on('will-quit', () => { filelog.line('════ Выход из лаунчера'); rpc.disable(); });
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  if (gameRunning()) {
+    filelog.line('Окно закрыто при работающей игре — жду её завершения в фоне.');
+  } else {
+    app.quit();
+  }
+});
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
 // ─── Хелперы прогресса ────────────────────────────────────────────────
@@ -608,6 +712,7 @@ ipcMain.handle('get-config', () => {
     versionInfo: { ...VERSION_INFO, launcher: app.getVersion() },
     account: resolveAccount(config),
     bgMedia: bgMedia(config.theme && config.theme.bgImage),
+    arch: process.arch, // ia32-сборке renderer урезает ползунок памяти
   };
 });
 // Renderer шлёт только игровые настройки — мержим по белому списку, иначе
@@ -636,7 +741,15 @@ ipcMain.handle('open-external', (_e, url) => {
   return shell.openExternal(target);
 });
 ipcMain.on('window-min', () => mainWindow && mainWindow.minimize());
-ipcMain.on('window-close', () => app.quit());
+ipcMain.on('window-close', () => {
+  // Игра идёт → закрываем только окно: убей мы процесс — вместе с ним умер бы
+  // и Minecraft (дочерний процесс). Игра доиграет — процесс выйдет сам.
+  if (gameRunning()) {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
+  } else {
+    app.quit();
+  }
+});
 
 ipcMain.handle('pick-dir', async () => {
   const res = await dialog.showOpenDialog(mainWindow, { properties: ['openDirectory', 'createDirectory'] });
@@ -872,6 +985,47 @@ ipcMain.handle('skin-state', () => {
   return community.skinState(nick);
 });
 
+// Черновики рисунков (плащ/флаг): лежат локально в userData и переживают
+// перезапуск лаунчера — можно бросить рисунок и вернуться к нему в любой момент.
+function draftsFile() { return path.join(app.getPath('userData'), 'draw-drafts.json'); }
+function loadDraftsAll() {
+  try { return JSON.parse(fs.readFileSync(draftsFile(), 'utf8')) || {}; } catch (_) { return {}; }
+}
+function saveDraftsAll(all) {
+  try { fs.writeFileSync(draftsFile(), JSON.stringify(all)); } catch (e) { logLine('черновик не сохранился: ' + e.message); }
+}
+const DRAFT_KINDS = new Set(['cape', 'flag']);
+ipcMain.handle('draft-load', (_e, { kind }) => {
+  const nick = currentNick();
+  if (!nick || !DRAFT_KINDS.has(kind)) return null;
+  return loadDraftsAll()[nick + ':' + kind] || null;
+});
+ipcMain.handle('draft-save', (_e, { kind, zones }) => {
+  const nick = currentNick();
+  if (!nick || !DRAFT_KINDS.has(kind) || !zones || typeof zones !== 'object') return false;
+  const clean = {};
+  for (const z of ['face', 'elytra']) {
+    const v = zones[z];
+    // зоны крошечные (20×40 максимум) — data:-строка больше 300 КБ означает мусор
+    if (typeof v === 'string' && v.startsWith('data:image/png;base64,') && v.length < 300000) clean[z] = v;
+  }
+  if (!Object.keys(clean).length) return false;
+  const all = loadDraftsAll();
+  all[nick + ':' + kind] = { zones: clean, ts: Date.now() };
+  saveDraftsAll(all);
+  return true;
+});
+ipcMain.handle('draft-clear', (_e, { kind }) => {
+  const nick = currentNick();
+  if (!nick) return false;
+  const all = loadDraftsAll();
+  if (nick + ':' + kind in all) {
+    delete all[nick + ':' + kind];
+    saveDraftsAll(all);
+  }
+  return true;
+});
+
 // Рисованные плащи и флаги: состояние своих заявок и отправка на модерацию.
 ipcMain.handle('drawings-list', () => community.drawings(currentNick()));
 ipcMain.handle('drawing-submit', (_e, { kind, png }) => {
@@ -940,7 +1094,9 @@ let launching = false;
 ipcMain.handle('launch-game', async (_e, opts) => {
   if (launching) return { ok: false, error: 'Уже идёт запуск' };
   const loader = opts.loader || 'fabric';
-  const ram = Math.max(1024, Math.min(32768, parseInt(opts.ram, 10) || 4096));
+  // 32-битный процесс адресует ~2 ГБ на всё: больше ~1 ГБ кучи JVM не поднимет
+  const ramCap = process.arch === 'ia32' ? 1024 : 32768;
+  const ram = Math.max(process.arch === 'ia32' ? 512 : 1024, Math.min(ramCap, parseInt(opts.ram, 10) || 4096));
   const joinServer = !!opts.joinServer;
   const gameDir = opts.gameDir || defaultGameDir();
 
@@ -953,6 +1109,9 @@ ipcMain.handle('launch-game', async (_e, opts) => {
   launching = true;
   send('state', { state: 'working' });
   try {
+    if (process.arch === 'ia32' && (parseInt(opts.ram, 10) || 4096) > ram) {
+      logLine('ⓘ 32-битная система: память игры ограничена ' + ram + ' МБ.');
+    }
     // msa: обновляем токен Microsoft → свежий Minecraft-токен.
     // offline: играем по нику, токен не нужен (FastLogin на сервере разрулит).
     let account;
@@ -1074,13 +1233,14 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       gameProfile: { name: account.name, id: account.uuid },
       accessToken: account.accessToken,
       userType: account.userType,
-      minMemory: Math.min(1024, ram),
+      minMemory: Math.min(process.arch === 'ia32' ? 512 : 1024, ram),
       maxMemory: ram,
       launcherName: 'MistMC',
       launcherBrand: 'MistMC',
       versionType: 'Mist MC',
       quickPlayMultiplayer: joinServer ? JOIN_HOST : undefined,
     });
+    gameProc = proc; // пока жив — закрытие окна не завершает лаунчер
 
     // Логи процесса (кратко) + хвост для разбора краша: если игра упала из-за
     // мижина стороннего мода, по этому хвосту находим виновника
@@ -1093,10 +1253,12 @@ ipcMain.handle('launch-game', async (_e, opts) => {
 
     const watcher = createMinecraftProcessWatcher(proc);
     watcher.on('error', (err) => {
+      gameProc = null;
       logLine('✖ ' + (err && err.message ? err.message : String(err)));
       launching = false;
       send('state', { state: 'idle' });
       send('launch-error', String(err && err.message ? err.message : err));
+      if (!mainWindow || mainWindow.isDestroyed()) app.quit();
     });
     watcher.on('minecraft-window-ready', () => {
       status('Игра запущена');
@@ -1107,6 +1269,7 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
     });
     watcher.on('minecraft-exit', ({ code, crashReport, crashReportLocation }) => {
+      gameProc = null;
       launching = false;
       logLine('■ Игра закрыта (код ' + code + ')');
       if (code !== 0 && crashReport) {
@@ -1132,7 +1295,13 @@ ipcMain.handle('launch-game', async (_e, opts) => {
         rpc.setIdle(account.name);
       }
       send('state', { state: 'idle' });
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.restore();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.restore();
+      } else {
+        // окно закрыли во время игры — фоновому процессу больше нечего ждать
+        filelog.line('Игра закрыта, окна нет — выходим.');
+        app.quit();
+      }
     });
 
     return { ok: true };

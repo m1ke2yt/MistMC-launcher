@@ -1811,7 +1811,74 @@ function imageToZones(image) {
     }
     return out;
   }
+  // любой другой размер (например 32×32) — растягиваем в текущую зону как есть:
+  // пиксели пересэмплируются «ближайшим соседом», без мыла. Флаг _scaled
+  // вынимает вызывающий — в draw.zones он попасть не должен.
+  if (image.width > 0 && image.height > 0 && image.width <= 4096 && image.height <= 4096) {
+    const out = { _scaled: true };
+    out[draw.zone] = cut(0, 0, image.width, image.height, cur.w, cur.h);
+    return out;
+  }
   return null;
+}
+
+// ── Черновики: рисунок автосохраняется локально и переживает перезапуск ──
+function zoneToDataUrl(img) {
+  const cv = document.createElement('canvas');
+  cv.width = img.width;
+  cv.height = img.height;
+  cv.getContext('2d').putImageData(img, 0, 0);
+  return cv.toDataURL('image/png');
+}
+
+let draftSaveTimer = null;
+function scheduleDraftSave() {
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(() => {
+    if (!draw.canvas || !window.api.draftSave) return;
+    draw.zones[draw.zone] = draw.img;
+    const zones = {};
+    for (const z of ['face', 'elytra']) {
+      if (draw.zones[z]) zones[z] = zoneToDataUrl(draw.zones[z]);
+    }
+    window.api.draftSave(draw.kind, zones).catch(() => {});
+  }, 600);
+}
+
+function dataUrlToImageData(url, w, h) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const cv = document.createElement('canvas');
+      cv.width = w;
+      cv.height = h;
+      const ctx = cv.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, 0, 0, img.width, img.height, 0, 0, w, h);
+      resolve(ctx.getImageData(0, 0, w, h));
+    };
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+async function loadDraft(kind) {
+  try {
+    if (!window.api.draftLoad) return null;
+    const d = await window.api.draftLoad(kind);
+    if (!d || !d.zones) return null;
+    const out = {};
+    for (const z of ['face', 'elytra']) {
+      if (!d.zones[z]) continue;
+      if (z === 'elytra' && kind !== 'cape') continue;
+      const r = zoneRect(z);
+      const img = await dataUrlToImageData(d.zones[z], r.w, r.h);
+      if (img) out[z] = img;
+    }
+    return Object.keys(out).length ? out : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function drawStatusText(kind) {
@@ -1850,7 +1917,16 @@ async function openDrawEditor(kind) {
   const sha = mine && (mine.pendSha1 || mine.liveSha1);
   if (sha) {
     const loaded = await loadTextureBySha(sha);
-    if (loaded) Object.assign(draw.zones, loaded);
+    if (loaded) {
+      delete loaded._scaled;
+      Object.assign(draw.zones, loaded);
+    }
+  }
+  // черновик важнее отправленного: игрок возвращается ровно туда, где бросил
+  const draft = await loadDraft(kind);
+  if (draft) {
+    Object.assign(draw.zones, draft);
+    els.drawHint.textContent = 'Черновик восстановлен — продолжай с того же места.';
   }
   draw.img = draw.zones.face;
   fitDrawScale();
@@ -1934,6 +2010,7 @@ function bindDrawEditor() {
     else if (draw.tool === 'erase') setPx(x, y, [0, 0, 0], 0);
     else setPx(x, y, hexToRgb(draw.color), 255);
     renderDrawCanvas();
+    scheduleDraftSave();
   };
 
   els.drawCanvas.addEventListener('pointerdown', (e) => {
@@ -1950,12 +2027,14 @@ function bindDrawEditor() {
     if (!prev) return;
     draw.img.data.set(prev);
     renderDrawCanvas();
+    scheduleDraftSave();
   });
   els.drawClear.addEventListener('click', () => {
     pushHistory();
     draw.img = drawTemplate();
     draw.zones[draw.zone] = draw.img;
     renderDrawCanvas();
+    scheduleDraftSave();
   });
   document.addEventListener('keydown', (e) => {
     if (overlay.hidden) return;
@@ -1978,18 +2057,22 @@ function bindDrawEditor() {
         if (!got) {
           const r = zoneRect();
           const full = draw.canvas;
-          els.drawHint.textContent = `Не тот размер: нужен ${r.w}×${r.h}, весь холст ${full.w}×${full.h}`
-            + (draw.kind === 'cape' ? ' или обычный плащ 64×32' : '') + '.';
+          els.drawHint.textContent = `Не удалось разобрать картинку: подойдёт ${r.w}×${r.h}, весь холст ${full.w}×${full.h}`
+            + (draw.kind === 'cape' ? ', обычный плащ 64×32' : '') + ' или любой PNG до 4096×4096.';
           return;
         }
+        const scaled = got._scaled;
+        delete got._scaled;
         pushHistory();
         Object.assign(draw.zones, got);
         draw.img = draw.zones[draw.zone] || drawTemplate();
         draw.zones[draw.zone] = draw.img;
-        els.drawHint.textContent = got.elytra && got.face
-          ? 'Картинка загружена: плащ и элитры.'
-          : 'Картинка загружена.';
+        const r = zoneRect();
+        els.drawHint.textContent = scaled
+          ? `Картинка ${image.width}×${image.height} растянута под зону ${r.w}×${r.h}.`
+          : (got.elytra && got.face ? 'Картинка загружена: плащ и элитры.' : 'Картинка загружена.');
         renderDrawCanvas();
+        scheduleDraftSave();
       };
       image.onerror = () => { els.drawHint.textContent = 'Не удалось прочитать PNG.'; };
       image.src = reader.result;
@@ -2007,6 +2090,8 @@ function bindDrawEditor() {
         draw.drawings = res.drawings || draw.drawings;
         els.drawStatus.textContent = drawStatusText(draw.kind);
         els.drawHint.textContent = 'Отправлено модератору.';
+        // рисунок теперь хранит сайт — локальный черновик своё отработал
+        if (window.api.draftClear) window.api.draftClear(draw.kind).catch(() => {});
         loadCosmetics();
       } else {
         els.drawHint.textContent = 'Не вышло: ' + ((res && res.error) || '?');
@@ -2595,13 +2680,25 @@ window.addEventListener('resize', () => {
 
 // ── init ────────────────────────────────────────────────────────────────
 async function init() {
-  const { config, versionInfo, account, bgMedia } = await window.api.getConfig();
+  const { config, versionInfo, account, bgMedia, arch } = await window.api.getConfig();
   // тему применяем первым делом, чтобы не мигнуть стандартной
   state.theme = config.theme || {};
   state.bgMedia = bgMedia || null;
   applyTheme(state.theme);
   applyBackground(state.bgMedia, state.theme);
-  els.ram.value = config.ram || 4096;
+  if (arch === 'ia32') {
+    // 32-битный JVM не поднимет кучу больше ~1 ГБ — ползунок честно урезаем
+    els.ram.min = 512;
+    els.ram.max = 1024;
+    els.ram.step = 128;
+    const scale = els.ram.closest('.field')?.querySelector('.hint.scale');
+    if (scale) {
+      const [lo, hi] = scale.querySelectorAll('span');
+      if (lo) lo.textContent = '512 МБ';
+      if (hi) hi.textContent = '1 ГБ';
+    }
+  }
+  els.ram.value = Math.min(config.ram || 4096, parseInt(els.ram.max, 10));
   els.ramVal.textContent = els.ram.value;
   els.joinServer.checked = config.joinServer !== false;
   els.discordRpc.checked = config.discordRpc !== false;
