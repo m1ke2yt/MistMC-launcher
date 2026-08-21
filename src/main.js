@@ -319,20 +319,55 @@ let mainWindow = null;
 let gameProc = null;
 function gameRunning() { return !!(gameProc && gameProc.exitCode === null && !gameProc.killed); }
 
-// Один экземпляр: лаунчер умеет жить в фоне без окна (см. выше), поэтому
-// повторный запуск exe не плодит второй процесс, а будит первый — тот заново
-// открывает окно.
+// Одиночная блокировка нужна только для одного: разбудить лаунчер, который
+// ждёт игру В ФОНЕ без окна (см. window-close). Осознанный второй запуск при
+// ОТКРЫТОМ окне — легальный сценарий (мультиаккаунт: два лаунчера, два ника),
+// он работает как до 1.7.0 — независимым процессом. Отличаем случаи маркером:
+// фоновый держатель блокировки пишет свой pid в background.pid.
+const BG_MARKER = path.join(app.getPath('userData'), 'background.pid');
+function setBackgroundMarker(on) {
+  try {
+    if (on) fs.writeFileSync(BG_MARKER, String(process.pid));
+    else clearOwnMarker();
+  } catch (_) {}
+}
+function clearOwnMarker() {
+  try {
+    if (parseInt(fs.readFileSync(BG_MARKER, 'utf8'), 10) === process.pid) fs.unlinkSync(BG_MARKER);
+  } catch (_) {}
+}
+function backgroundInstanceAlive() {
+  try {
+    const pid = parseInt(fs.readFileSync(BG_MARKER, 'utf8'), 10);
+    if (!pid || pid === process.pid) return false;
+    process.kill(pid, 0); // жив ли процесс; сигнал не шлётся
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+// true = мы «второй лаунчер» мультиаккаунта: без блокировки и без фонового маркера
+let multiInstance = false;
+// Маркер читаем ДО запроса блокировки: сам запрос будит фонового держателя,
+// тот пересоздаёт окно и стирает маркер — прочитав после, мы бы решили,
+// что это мультиаккаунт, и открыли второе окно рядом с разбуженным.
+const wasBackgroundAlive = backgroundInstanceAlive();
 if (!app.requestSingleInstanceLock()) {
-  filelog.line('Лаунчер уже запущен — бужу его окно и выхожу.');
-  app.exit(0);
+  if (wasBackgroundAlive) {
+    filelog.line('Лаунчер уже ждёт игру в фоне — бужу его окно и выхожу.');
+    app.exit(0);
+  } else {
+    multiInstance = true;
+    filelog.line('Второй экземпляр (мультиаккаунт) — работаю независимо, без одиночной блокировки.');
+  }
 }
 app.on('second-instance', () => {
   app.whenReady().then(() => {
+    // Будим только фоновый режим. Если окно открыто — ничего не делаем:
+    // новый процесс увидит это и запустится сам, отдельным лаунчером.
     if (!mainWindow || mainWindow.isDestroyed()) {
       createWindow();
-    } else {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
+      clearOwnMarker();
     }
   });
 });
@@ -482,10 +517,13 @@ app.whenReady().then(() => {
     rpc.setIdle(resolveAccount(cfg)?.name);
   }
 });
-app.on('will-quit', () => { filelog.line('════ Выход из лаунчера'); rpc.disable(); });
+app.on('will-quit', () => { filelog.line('════ Выход из лаунчера'); clearOwnMarker(); rpc.disable(); });
 app.on('window-all-closed', () => {
   if (gameRunning()) {
     filelog.line('Окно закрыто при работающей игре — жду её завершения в фоне.');
+    // маркер пишет только держатель блокировки: повторный запуск exe будит
+    // именно его; мульти-экземпляры ждут молча, их relaunch не касается
+    if (!multiInstance) setBackgroundMarker(true);
   } else {
     app.quit();
   }
@@ -1092,6 +1130,25 @@ ipcMain.handle('build-apply', async (_e, { code, parts }) => {
 let launching = false;
 
 ipcMain.handle('launch-game', async (_e, opts) => {
+  // Дев-проверка фонового режима БЕЗ реальной игры (в release-сборке инертно):
+  //   MISTMC_FAKE_GAME=1 npx electron .  → «игра» = пустой node-процесс на 10 мин
+  if (!app.isPackaged && process.env.MISTMC_FAKE_GAME) {
+    if (gameRunning()) return { ok: false, error: 'фейк-игра уже идёт' };
+    const cp = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'],
+      { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: 'ignore' });
+    gameProc = cp;
+    send('state', { state: 'running' });
+    logLine('▶ [тест] фейк-игра pid ' + cp.pid);
+    cp.on('exit', () => {
+      gameProc = null;
+      send('state', { state: 'idle' });
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        filelog.line('[тест] фейк-игра вышла, окна нет — выходим.');
+        app.quit();
+      }
+    });
+    return { ok: true };
+  }
   if (launching) return { ok: false, error: 'Уже идёт запуск' };
   const loader = opts.loader || 'fabric';
   // 32-битный процесс адресует ~2 ГБ на всё: больше ~1 ГБ кучи JVM не поднимет
