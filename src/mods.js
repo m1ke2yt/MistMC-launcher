@@ -13,6 +13,7 @@ const path = require('path');
 const zlib = require('zlib');
 const os = require('os');
 const { fetch, Agent } = require('undici');
+const site = require('./site');
 
 const API = 'https://api.modrinth.com/v2';
 const USER_AGENT = 'MistMC-Launcher/1.2.0 (mistmc.gg)';
@@ -32,9 +33,12 @@ const PROXY_STICKY_MS = 5 * 60_000;
 let preferProxyUntil = 0;
 
 function toProxyUrl(url) {
+  // база с фолбэком: mistmc.gg, а если он заблокирован в стране игрока
+  // (Украина vs RU IP) — зеркало files.mistmc.gg/site
+  const base = site.baseSync();
   return url
-    .replace('https://api.modrinth.com/', 'https://mistmc.gg/modrinth-api/')
-    .replace('https://cdn.modrinth.com/', 'https://mistmc.gg/modrinth-cdn/');
+    .replace('https://api.modrinth.com/', base + '/modrinth-api/')
+    .replace('https://cdn.modrinth.com/', base + '/modrinth-cdn/');
 }
 
 // fetch с таймаутом только на ЗАГОЛОВКИ: тело больших файлов не ограничиваем
@@ -57,6 +61,7 @@ async function fetchHeaderTimeout(url, timeoutMs) {
 }
 
 async function robustFetch(url) {
+  site.getBase().catch(() => {}); // фоновая проба, чтобы toProxyUrl знал актуальную базу
   const proxied = toProxyUrl(url);
   const useProxyFirst = Date.now() < preferProxyUntil && proxied !== url;
   const order = useProxyFirst ? [proxied, url] : [url, proxied];

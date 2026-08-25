@@ -18,6 +18,7 @@ const cosmeticassets = require('./cosmeticassets');
 const migrate = require('./migrate');
 const translate = require('./translate');
 const community = require('./community');
+const site = require('./site');
 const buildSecret = require('./build-secret');
 const filelog = require('./filelog');
 
@@ -111,7 +112,7 @@ const SERVER_HOST = 'mistmc.gg';  // Java SRV → connect.mistmc.gg:25584
 const JOIN_HOST = 'connect.mistmc.gg:25584';
 // MISTMC_SITE_URL — для локальной отладки против dev-сервера сайта
 const SITE_URL = process.env.MISTMC_SITE_URL || 'https://mistmc.gg';
-const MS_CLIENT_ID = 'YOUR_AZURE_APP_CLIENT_ID'; // Azure App (MistMC Launcher)
+const MS_CLIENT_ID = 'fc39a138-e8b8-4d93-9fb9-c86f7c3d8e56'; // Azure App (MistMC Launcher)
 const DISCORD_RPC_APP_ID = '1531346124374409299'; // приложение «MistMC» (отдельное, только для Rich Presence)
 
 const VERSION_INFO = { mc: MC_VERSION, fabric: FABRIC_LOADER, forge: FORGE_VERSION, server: SERVER_HOST };
@@ -465,6 +466,7 @@ function setupAutoUpdate() {
   autoUpdater.autoInstallOnAppQuit = true; // не нажал кнопку — тихо доставится при закрытии
   let downloaded = false;
   let installWhenReady = false; // «Обновить» нажали, пока файл ещё качался
+  let mirrorFeed = false;       // фид переключён на зеркало files.mistmc.gg/dl
   autoUpdater.on('update-available', (info) => {
     logLine('⬆ Доступно обновление ' + info.version + ' — скачиваю в фоне…');
     send('update-state', { state: 'available', version: info.version });
@@ -482,6 +484,16 @@ function setupAutoUpdate() {
     // обновление — не повод мешать играть: только строка в лог
     logLine('⬆ автообновление: ' + (err && err.message ? err.message.split('\n')[0] : err));
     send('update-state', { state: 'error' });
+    // сайт не отвечает (например, RU IP заблокирован в стране игрока) —
+    // одна перепроба через зеркало релизов на VPS раздачи
+    if (!mirrorFeed) {
+      mirrorFeed = true;
+      try {
+        autoUpdater.setFeedURL({ provider: 'generic', url: site.MIRROR_DOWNLOADS });
+        logLine('⬆ пробую зеркало обновлений files.mistmc.gg…');
+        autoUpdater.checkForUpdates().catch(() => {});
+      } catch (_) {}
+    }
   });
   ipcMain.on('update-restart', () => {
     if (downloaded) {
@@ -508,9 +520,11 @@ app.whenReady().then(() => {
     }
   });
   createWindow();
+  // ранняя проба базы сайта (mistmc.gg или зеркало) — к моменту первого
+  // хартбита/каталога выбор уже сделан
+  site.getBase().catch(() => {});
   setupAutoUpdate();
   translate.init(app.getPath('userData'));
-  community.init(SITE_URL);
   const cfg = loadConfig();
   if (cfg.discordRpc !== false) {
     rpc.init(DISCORD_RPC_APP_ID, logLine);
@@ -559,7 +573,9 @@ function sendLauncherHeartbeat(nick, client) {
         .update(nick + '|' + version + '|' + body.ts)
         .digest('hex');
     }
-    fetch(SITE_URL + '/api/bridge/launcher/heartbeat', {
+    // site.siteFetch: mistmc.gg, а при его недоступности (RU IP блокируют
+    // из Украины) — зеркало files.mistmc.gg/site
+    site.siteFetch('/api/bridge/launcher/heartbeat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -1264,13 +1280,20 @@ ipcMain.handle('launch-game', async (_e, opts) => {
 
     // 3.7) Конфиг мода MistCapes: при отладке против локального прокси
     // (MISTMC_SITE_URL) мод плащей должен смотреть туда же; на проде
-    // конфиг убираем — мод живёт на своём дефолте https://mistmc.gg
+    // конфиг убираем — мод живёт на своём дефолте https://mistmc.gg.
+    // Если прямой сайт недоступен (RU IP заблокирован в стране игрока) —
+    // направляем мод на зеркало, иначе плащи не загрузятся.
     try {
       const capesCfg = path.join(gameDir, 'config', 'mistcapes.json');
+      await site.getBase().catch(() => {});
       if (process.env.MISTMC_SITE_URL) {
         fs.mkdirSync(path.dirname(capesCfg), { recursive: true });
         fs.writeFileSync(capesCfg, JSON.stringify({ base: SITE_URL }));
         logLine('  + плащи MistCapes → ' + SITE_URL);
+      } else if (site.isMirror()) {
+        fs.mkdirSync(path.dirname(capesCfg), { recursive: true });
+        fs.writeFileSync(capesCfg, JSON.stringify({ base: site.MIRROR }));
+        logLine('  + плащи MistCapes → зеркало (сайт недоступен напрямую)');
       } else if (fs.existsSync(capesCfg)) {
         fs.unlinkSync(capesCfg);
       }

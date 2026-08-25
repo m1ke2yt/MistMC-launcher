@@ -6,16 +6,13 @@
 // пользоваться лаунчером, поэтому наружу отдаём { ok:false, error } и молчим.
 
 const crypto = require('crypto');
-const { fetch, Agent } = require('undici');
+const { Agent } = require('undici');
 const buildSecret = require('./build-secret');
+// база сайта с фолбэком на зеркало (RU IP сайта заблокирован из Украины)
+const site = require('./site');
 
 const agent = new Agent({ connect: { timeout: 8000 }, headersTimeout: 12000, bodyTimeout: 30000 });
 const TIMEOUT_MS = 12000;
-
-let SITE = 'https://mistmc.gg';
-function init(siteUrl) {
-  if (siteUrl) SITE = String(siteUrl).replace(/\/+$/, '');
-}
 
 /** Добавляет ts и подпись HMAC (в публичной сборке ключа нет — уходит без неё). */
 function signBody(body, payload) {
@@ -34,7 +31,7 @@ async function call(path, { method = 'GET', body } = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(SITE + path, {
+    const res = await site.siteFetch(path, {
       method,
       headers: body ? { 'Content-Type': 'application/json' } : undefined,
       body: body ? JSON.stringify(body) : undefined,
@@ -121,7 +118,7 @@ async function skinState(nick) {
   if (!res || !res.ok || !res.skin || !res.skin.sha1) return { ok: true, url: null };
   return {
     ok: true,
-    url: `${SITE}/api/bridge/launcher/skin?nick=${encodeURIComponent(nick)}&png=1&v=${res.skin.sha1}`,
+    url: `${site.baseSync()}/api/bridge/launcher/skin?nick=${encodeURIComponent(nick)}&png=1&v=${res.skin.sha1}`,
     slim: !!res.skin.slim,
   };
 }
@@ -145,10 +142,10 @@ function cosmeticPack(nick) {
 
 /** Адрес сайта — нужен модулю сборки пака, чтобы качать текстуры. */
 function siteUrl() {
-  return SITE;
+  return site.baseSync();
 }
 
 module.exports = {
-  init, vote, ratings, top, shareBuild, fetchBuild, cosmetics, cosmeticAction,
+  vote, ratings, top, shareBuild, fetchBuild, cosmetics, cosmeticAction,
   drawings, submitDrawing, cosmeticPack, siteUrl, applySkin, resetSkin, skinState,
 };

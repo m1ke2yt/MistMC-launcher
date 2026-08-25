@@ -221,9 +221,25 @@ const LOADER_HINTS = {
 };
 const NICK_RE = /^[A-Za-z0-9_]{3,16}$/;
 
+// Журнал: строки добавляются отдельными текстовыми узлами с потолком по
+// количеству. Раньше было `textContent += line` — на каждую строку Chromium
+// пересобирал ВЕСЬ текст журнала и делал перелайаут; за долгую сессию журнал
+// разрастался до мегабайт, и каждое сообщение в игровом чате (в рантайме в
+// stdout игры попадают практически только [CHAT]-строки) стоило десятки мс CPU
+// даже у свёрнутого окна — у игроков это выглядело как микрофриз игры при
+// появлении сообщения. Скролл трогаем только когда журнал реально виден.
+const LOG_MAX_LINES = 1500;
+let logLines = 0;
 function log(line) {
-  els.logbox.textContent += (line + '\n');
-  els.logbox.scrollTop = els.logbox.scrollHeight;
+  const box = els.logbox;
+  box.appendChild(document.createTextNode(line + '\n'));
+  if (++logLines > LOG_MAX_LINES) {
+    box.removeChild(box.firstChild);
+    logLines--;
+  }
+  if (!box.hidden && document.visibilityState === 'visible') {
+    box.scrollTop = box.scrollHeight;
+  }
 }
 
 function setProgress(percent) {
