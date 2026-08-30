@@ -14,9 +14,10 @@ const site = require('./site');
 const agent = new Agent({ connect: { timeout: 8000 }, headersTimeout: 12000, bodyTimeout: 30000 });
 const TIMEOUT_MS = 12000;
 
-/** Добавляет ts и подпись HMAC (в публичной сборке ключа нет — уходит без неё). */
+/** Добавляет ts и подпись HMAC (в публичной сборке ключа нет — уходит без неё).
+ *  ts — по часам СЕРВЕРА (site.serverNow): сбитые часы игрока не ломают подпись. */
 function signBody(body, payload) {
-  const ts = Date.now();
+  const ts = site.serverNow();
   const out = Object.assign({}, body, { ts });
   if (buildSecret.HEARTBEAT_HMAC_KEY) {
     out.sig = crypto
@@ -40,7 +41,9 @@ async function call(path, { method = 'GET', body } = {}) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) {
-      return { ok: false, error: data.error || ('HTTP ' + res.status) };
+      let err = data.error || ('HTTP ' + res.status);
+      if (err === 'stale ts') err = 'часы на компьютере расходятся с сервером — проверьте время и часовой пояс';
+      return { ok: false, error: err };
     }
     return data;
   } catch (e) {

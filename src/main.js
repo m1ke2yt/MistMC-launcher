@@ -122,6 +122,21 @@ const VERSION_INFO = { mc: MC_VERSION, fabric: FABRIC_LOADER, forge: FORGE_VERSI
 const ASSETS_HOSTS = ['https://resources.download.minecraft.net', 'https://bmclapi2.bangbang93.com/assets'];
 const MAVEN_HOSTS = ['https://libraries.minecraft.net', 'https://bmclapi2.bangbang93.com/maven'];
 
+// Piston-хосты Mojang (version.json, client.jar, индекс ассетов) зеркалируются
+// на bmclapi с тем же путём — только хост другой. Официальный URL идёт первым,
+// зеркало запасным; sha1-проверка xmcl отсеивает битый ответ зеркала. Это
+// закрывает ПЕРВИЧНУЮ установку у игроков с полностью зарезанным Mojang
+// (у них раньше падала скачка client.jar с piston-data).
+function withMirror(url) {
+  try {
+    const u = new URL(url);
+    if (/^(piston-meta|piston-data|launchermeta|launcher)\.mojang\.com$/.test(u.host)) {
+      return [url, 'https://bmclapi2.bangbang93.com' + u.pathname];
+    }
+  } catch (_) { /* нестандартный URL — без зеркала */ }
+  return [url];
+}
+
 // Диспетчер undici: увеличенный таймаут соединения (дефолтные 10с рвутся на медленных
 // CDN под нагрузкой) + следование редиректам. Retry-интерцептор НЕ используем —
 // он конфликтует с докачкой xmcl (content-range mismatch); отказоустойчивость даёт
@@ -138,7 +153,54 @@ function makeDownloadOptions() {
     assetsDownloadConcurrency: 8,
     assetsHost: ASSETS_HOSTS,
     mavenHost: MAVEN_HOSTS,
+    // resolveDownloadUrls ставит наши URL первыми и дописывает оригинал в конец,
+    // если его нет в списке — поэтому возвращаем [оригинал, зеркало]: официальный
+    // хост остаётся приоритетным, дубля не будет.
+    json: (v) => withMirror(v.url),
+    client: (v) => withMirror(v.downloads.client.url),
+    assetsIndexUrl: (v) => withMirror(v.assetIndex.url),
   };
+}
+
+// Манифест версий: getVersionList из xmcl игнорирует dispatcher (принимает
+// только options.fetch/remote) и ходит глобальным fetch с дефолтными 10с —
+// у игроков, чей провайдер режет Mojang, запуск падал на первом же шаге
+// (живой кейс 30.08). Качаем сами: официальный хост → зеркало bmclapi →
+// кэш последнего удачного ответа. Кэш даёт уже установленным игрокам
+// запускаться вообще без доступа к Mojang.
+const VERSION_MANIFEST_URLS = [
+  'https://launchermeta.mojang.com/mc/game/version_manifest.json',
+  'https://bmclapi2.bangbang93.com/mc/game/version_manifest.json',
+];
+function manifestCachePath() {
+  return path.join(app.getPath('userData'), 'version_manifest.json');
+}
+async function fetchVersionList(dispatcher) {
+  const errors = [];
+  for (const url of VERSION_MANIFEST_URLS) {
+    const host = new URL(url).host;
+    try {
+      // Свой таймаут короче 60с диспетчера: заблокированный хост висит до
+      // упора, а игроку ещё ждать зеркало — 20с на попытку достаточно.
+      const res = await fetch(url, { dispatcher, signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const list = await res.json();
+      if (!Array.isArray(list.versions)) throw new Error('ответ без списка версий');
+      try { fs.writeFileSync(manifestCachePath(), JSON.stringify(list)); } catch (_) {}
+      return list;
+    } catch (e) {
+      errors.push(e);
+      logLine('ⓘ Манифест версий: ' + host + ' недоступен (' + describeError(e).split('\n')[0] + ')');
+    }
+  }
+  try {
+    const cached = JSON.parse(fs.readFileSync(manifestCachePath(), 'utf8'));
+    if (Array.isArray(cached.versions)) {
+      logLine('ⓘ Хосты манифеста недоступны — использую сохранённый с прошлого запуска');
+      return cached;
+    }
+  } catch (_) { /* кэша ещё нет */ }
+  throw new AggregateError(errors, 'Не удалось получить манифест версий Mojang');
 }
 
 // AggregateError от xmcl прячет реальные причины в .errors — разворачиваем в понятный текст.
@@ -158,7 +220,7 @@ function describeError(err) {
   })(err);
   const joined = msgs.join(' | ');
   let hint = '';
-  if (/CONNECT_TIMEOUT|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|fetch failed|socket/i.test(joined)) {
+  if (/CONNECT_TIMEOUT|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|fetch failed|socket|timeout/i.test(joined)) {
     hint = '\nПохоже на блокировку/обрыв сети у провайдера. Попробуйте включить VPN и запустить снова.';
   }
   return (msgs.slice(0, 3).join('\n') || (err && err.name) || 'неизвестная ошибка') + hint;
@@ -567,7 +629,8 @@ function sendLauncherHeartbeat(nick, client) {
     // лаунчер от подделки/ручного запроса. Без ключа (публичная сборка)
     // хартбит уходит неподписанным.
     if (buildSecret.HEARTBEAT_HMAC_KEY) {
-      body.ts = Date.now();
+      // ts по часам сервера — сбитые часы игрока не ломают подпись
+      body.ts = site.serverNow();
       body.sig = crypto
         .createHmac('sha256', buildSecret.HEARTBEAT_HMAC_KEY)
         .update(nick + '|' + version + '|' + body.ts)
@@ -1232,7 +1295,7 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     const dl = makeDownloadOptions();
 
     // 1) Ванильный клиент 1.21.11
-    const list = await installer.getVersionList({ dispatcher: dl.dispatcher });
+    const list = await fetchVersionList(dl.dispatcher);
     const meta = list.versions.find((v) => v.id === MC_VERSION);
     if (!meta) throw new Error('Версия ' + MC_VERSION + ' не найдена в манифесте Mojang');
     await runTask('Загрузка Minecraft ' + MC_VERSION, installer.installTask(meta, mc, dl));

@@ -27,6 +27,27 @@ let base = MAIN;          // текущая рабочая база
 let checkedAt = 0;        // когда пробовали в последний раз
 let probing = null;       // защита от параллельных проб
 
+// Смещение часов игрока относительно сервера (по заголовку Date любых ответов
+// сайта). Нужен подписям запросов: у заметной доли игроков часы сбиты сильнее
+// окна подписи (±10 мин; классика — «подогнанное» время при неверном часовом
+// поясе), и «stale ts» ломал им скины/косметику. Точность Date — секунда плюс
+// сетевая задержка: для окна в минуты более чем достаточно.
+let clockSkewMs = 0;
+
+function noteServerDate(res) {
+  try {
+    const d = res && res.headers && res.headers.get('date');
+    if (!d) return;
+    const t = Date.parse(d);
+    if (Number.isFinite(t)) clockSkewMs = t - Date.now();
+  } catch (_) { /* ignore */ }
+}
+
+/** Текущее время ПО ЧАСАМ СЕРВЕРА — для ts в подписанных запросах. */
+function serverNow() {
+  return Date.now() + clockSkewMs;
+}
+
 async function probeOne(url) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
@@ -71,13 +92,16 @@ function isMirror() {
 async function siteFetch(path, options) {
   const first = await getBase();
   try {
-    return await fetch(first + path, options);
+    const res = await fetch(first + path, options);
+    noteServerDate(res);
+    return res;
   } catch (e) {
     const alt = first === MAIN ? MIRROR : MAIN;
     try {
       const res = await fetch(alt + path, options);
       base = alt; // альтернатива ответила — прилипаем к ней
       checkedAt = Date.now();
+      noteServerDate(res);
       return res;
     } catch (_) {
       throw e;
@@ -85,4 +109,4 @@ async function siteFetch(path, options) {
   }
 }
 
-module.exports = { MAIN, MIRROR, MIRROR_DOWNLOADS, getBase, baseSync, isMirror, siteFetch };
+module.exports = { MAIN, MIRROR, MIRROR_DOWNLOADS, getBase, baseSync, isMirror, siteFetch, serverNow };
