@@ -6,7 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-const { launch, Version, MinecraftFolder, createMinecraftProcessWatcher } = require('@xmcl/core');
+const { launch, Version, MinecraftFolder, createMinecraftProcessWatcher, DEFAULT_EXTRA_JVM_ARGS } = require('@xmcl/core');
 const installer = require('@xmcl/installer');
 const { Agent, interceptors } = require('undici');
 const msauth = require('./msauth');
@@ -160,6 +160,39 @@ function makeDownloadOptions() {
     client: (v) => withMirror(v.downloads.client.url),
     assetsIndexUrl: (v) => withMirror(v.assetIndex.url),
   };
+}
+
+// Сессионные сервисы Mojang: клиент проверяет подписи скинов ДРУГИХ игроков
+// ключами с api.minecraftservices.com/publickeys. У провайдеров, режущих
+// Mojang, ключи не скачиваются и клиент молча бракует все чужие скины
+// («Profile contained invalid signature for textures property» — живой кейс
+// 30.08, у игрока все вокруг стивы). Перед запуском пробуем достучаться до
+// Mojang; срезано — переводим session/services/profiles-хосты клиента на
+// реверс-прокси зеркала (JVM-флаги authlib, ответы 1:1 от Mojang).
+// profiles.host обязателен: EnvironmentParser authlib 7 читает все три.
+const MOJANG_SESSION_PROBE = 'https://api.minecraftservices.com/publickeys';
+const MOJANG_PROXY = 'https://files.mistmc.gg/mojang';
+async function mojangSessionJvmArgs() {
+  try {
+    const res = await fetch(MOJANG_SESSION_PROBE, { signal: AbortSignal.timeout(6000) });
+    if (res.ok) return [];
+    throw new Error('HTTP ' + res.status);
+  } catch (e) {
+    logLine('ⓘ Сервисы Mojang недоступны (' + describeError(e).split('\n')[0] + ') — скины пойдут через зеркало');
+  }
+  try {
+    // прокси тоже может быть недоступен — тогда штатные хосты (хуже не станет)
+    const res = await fetch(MOJANG_PROXY + '/services/publickeys', { signal: AbortSignal.timeout(6000) });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+  } catch (e) {
+    logLine('ⓘ Зеркало Mojang-сервисов тоже недоступно (' + describeError(e).split('\n')[0] + ') — запускаю со штатными хостами');
+    return [];
+  }
+  return [
+    '-Dminecraft.api.session.host=' + MOJANG_PROXY + '/session',
+    '-Dminecraft.api.services.host=' + MOJANG_PROXY + '/services',
+    '-Dminecraft.api.profiles.host=' + MOJANG_PROXY + '/profiles',
+  ];
 }
 
 // Манифест версий: getVersionList из xmcl игнорирует dispatcher (принимает
@@ -1294,6 +1327,9 @@ ipcMain.handle('launch-game', async (_e, opts) => {
 
     const dl = makeDownloadOptions();
 
+    // Проба Mojang — параллельно с установкой, к моменту launch() уже готова
+    const mojangArgsPromise = mojangSessionJvmArgs();
+
     // 1) Ванильный клиент 1.21.11
     const list = await fetchVersionList(dl.dispatcher);
     const meta = list.versions.find((v) => v.id === MC_VERSION);
@@ -1330,6 +1366,11 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     try {
       await mods.enforceJarDeps(gameDir, loader, MC_VERSION, logLine);
     } catch (_) { /* без сети играем как есть */ }
+    // 3.2) Freecam: непатченные джарники (с пролётом сквозь стены) подменяются
+    // честной сборкой Mist; без сети — усыпляются, играем без freecam
+    try {
+      await mods.enforceFairFreecam(gameDir, logLine);
+    } catch (_) { /* запуск важнее */ }
 
     // 3.5) Серверный ресурспак (петы) с автообновлением по sha1 — запасной
     // канал к раздаче пака сервером; сбои сети запуску не мешают
@@ -1382,6 +1423,13 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       launcherBrand: 'MistMC',
       versionType: 'Mist MC',
       quickPlayMultiplayer: joinServer ? JOIN_HOST : undefined,
+      // свои extraJVMArgs ЗАМЕНЯЮТ дефолтные xmcl — дефолт возвращаем сами;
+      // -Xmx2G из дефолтов выкидываем, как делает xmcl при заданном maxMemory
+      // (иначе он встал бы ПОСЛЕ нашего -Xmx и урезал память до 2 ГБ)
+      extraJVMArgs: [
+        ...DEFAULT_EXTRA_JVM_ARGS.filter((v) => v !== '-Xmx2G'),
+        ...(await mojangArgsPromise),
+      ],
     });
     gameProc = proc; // пока жив — закрытие окна не завершает лаунчер
 

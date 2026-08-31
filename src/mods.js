@@ -101,6 +101,27 @@ const BLOCK_SLUGS = new Set([
   'litematica-printer', // принтер режется античитом Mist MC
 ]);
 const ALLOW_SLUGS = new Set(['legacyfreecam']);
+
+// «Freecam (Fair Play)» с Modrinth на деле собран ОБЫЧНЫМ вариантом мода:
+// в его настройках включается «Игнорировать всю коллизию», и камера летает
+// сквозь стены (проверено 31.08 на 1.1.1+mc1.21.11 — в джарнике вариант
+// «normal», никакой блокировки читов нет). Поэтому Modrinth для этого мода
+// не источник: ставим и принудительно поддерживаем нашу сборку, из которой
+// вырезаны миксины коллизии (BlockStateBaseMixin) и полной яркости
+// (LightTextureMixin) — пункты в меню остаются, но не действуют.
+// Признак нашей сборки — файл-маркер mist-fairplay внутри джарника.
+const FAIR_FREECAM = {
+  projectId: 'tWqI1yhH',
+  slug: 'legacyfreecam',
+  modIds: new Set(['legacy-freecam', 'freecam']), // ловим и оригинальный freecam, закинутый руками
+  fileName: 'legacy-freecam-fabric-1.1.1+mc1.21.11-mist.jar',
+  marker: 'mist-fairplay',
+  versionId: 'mist-fairplay-1',
+  versionNumber: '1.1.1-mist',
+};
+function fairFreecamUrl() {
+  return site.MIRROR_DOWNLOADS + '/mods/' + encodeURIComponent(FAIR_FREECAM.fileName);
+}
 function isBlocked(text, slug) {
   if (ALLOW_SLUGS.has(slug)) return false;
   if (BLOCK_SLUGS.has(slug)) return true;
@@ -393,6 +414,35 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
 
   const existing = m.user.find((e) => e.projectId === project.projectId && e.type === type
       && (!t.perLoader || e.loader === loader));
+
+  // freecam ставится ТОЛЬКО нашей сборкой (см. FAIR_FREECAM) — пины и версии
+  // Modrinth к нему неприменимы
+  if (type === 'mod' && (project.slug === FAIR_FREECAM.slug || project.projectId === FAIR_FREECAM.projectId)) {
+    if (loader !== 'fabric') return { ok: false, error: 'Нет сборки под ' + mcVersion + ' / ' + loader };
+    if (existing && existing.versionId === FAIR_FREECAM.versionId) return { ok: true, already: true };
+    if (existing) {
+      log('  ⟳ ' + existing.title + ': ' + (existing.versionNumber || '?') + ' → ' + FAIR_FREECAM.versionNumber);
+      removeUserContent(gameDir, 'mod', existing.fileName);
+    }
+    fs.mkdirSync(contentDir(gameDir, 'mod'), { recursive: true });
+    await downloadTo(fairFreecamUrl(), path.join(contentDir(gameDir, 'mod'), FAIR_FREECAM.fileName), log);
+    const withCam = readManifest(gameDir);
+    withCam.user.push({
+      projectId: FAIR_FREECAM.projectId,
+      slug: FAIR_FREECAM.slug,
+      title: project.title || 'Freecam (Fair Play)',
+      iconUrl: project.iconUrl || '',
+      fileName: FAIR_FREECAM.fileName,
+      type: 'mod',
+      loader,
+      enabled: true,
+      versionNumber: FAIR_FREECAM.versionNumber,
+      versionId: FAIR_FREECAM.versionId,
+    });
+    writeManifest(gameDir, withCam);
+    log('✓ Установлен ' + (project.title || 'Freecam (Fair Play)') + ' — сборка Mist MC, пролёт сквозь стены вырезан');
+    return { ok: true };
+  }
 
   // pinnedVersionId приходит от enforceJarDeps — это АВТОРИТЕТ (посчитан по
   // fabric.mod.json всех установленных модов), выполняем даже заменой стоящей
@@ -1094,6 +1144,48 @@ function syncMods(gameDir, loader, bundledDir, log) {
 }
 
 /**
+ * Freecam-надзор перед каждым запуском: любой джарник в mods с fabric-id
+ * freecam/legacy-freecam БЕЗ нашего маркера (см. FAIR_FREECAM) — это сборка
+ * с пролётом сквозь стены: и та, что каталог ставил до фикса, и закинутая
+ * руками. Подменяем честной сборкой с раздачи; если сети нет — усыпляем
+ * файл (fail closed): лучше без freecam, чем с читом.
+ */
+async function enforceFairFreecam(gameDir, log) {
+  const dir = contentDir(gameDir, 'mod');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (_) { return; }
+  for (const f of names) {
+    if (!f.endsWith('.jar')) continue;
+    const full = path.join(dir, f);
+    let info = null;
+    try { info = fabricModInfo(full); } catch (_) { continue; }
+    if (!info || !FAIR_FREECAM.modIds.has(info.id)) continue;
+    if (readZipEntry(full, FAIR_FREECAM.marker)) continue; // уже наша сборка
+    const dest = path.join(dir, FAIR_FREECAM.fileName);
+    try {
+      if (!fs.existsSync(dest) || !readZipEntry(dest, FAIR_FREECAM.marker)) {
+        await downloadTo(fairFreecamUrl(), dest, log);
+      }
+      if (full !== dest) fs.unlinkSync(full);
+      log('  ⟳ ' + f + ' → честная сборка freecam (пролёт сквозь стены вырезан)');
+    } catch (e) {
+      try { fs.renameSync(full, full + '.cheat.disabled'); } catch (_) { /* файл занят */ }
+      log('  − ' + f + ': непатченный freecam отключён (честная сборка недоступна: ' + e.message + ')');
+      continue;
+    }
+    const m = readManifest(gameDir);
+    const entry = m.user.find((e2) => e2.type === 'mod' && e2.fileName === f)
+      || m.user.find((e2) => e2.type === 'mod' && e2.projectId === FAIR_FREECAM.projectId);
+    if (entry) {
+      entry.fileName = FAIR_FREECAM.fileName;
+      entry.versionNumber = FAIR_FREECAM.versionNumber;
+      entry.versionId = FAIR_FREECAM.versionId;
+      writeManifest(gameDir, m);
+    }
+  }
+}
+
+/**
  * Выключить мод по его fabric-id (виновник краша из разбора лога).
  * Ищем джарник по fabric.mod.json среди всех в папке — и реестровых, и
  * закинутых руками. Возвращает имя файла или null, если не нашли/не вышло.
@@ -1382,6 +1474,7 @@ module.exports = {
   disableModById,
   syncMods,
   enforceJarDeps,
+  enforceFairFreecam,
   collectClientInventory,
   exportBuild,
   applyBuild,
