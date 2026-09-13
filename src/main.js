@@ -104,7 +104,11 @@ protocol.registerSchemesAsPrivileged([
 
 // ─── Константы проекта ────────────────────────────────────────────────
 const MC_VERSION = '1.21.11';
-const FABRIC_LOADER = '0.19.3';   // последний стабильный loader под 1.21.11
+// Минимальный Fabric Loader. Реальную версию берём из меты Fabric при запуске
+// (resolveFabricLoader): свежий стабильный, но не ниже этого пина. Пин прибитый
+// «навсегда» уже стрелял: 0.19.3 держался, пока Fabric Language Kotlin 1.14
+// (07.09) не потребовал >=0.19.5 — новички падали сразу после установки.
+const FABRIC_LOADER = '0.19.5';
 const FORGE_VERSION = '61.1.0';   // recommended Forge под 1.21.11
 const SERVER_HOST = 'mistmc.gg';  // Java SRV → connect.mistmc.gg:25584
 // Автоподключение идёт по фактическому эндпоинту: по хосту в хендшейке сервер
@@ -234,6 +238,44 @@ async function fetchVersionList(dispatcher) {
     }
   } catch (_) { /* кэша ещё нет */ }
   throw new AggregateError(errors, 'Не удалось получить манифест версий Mojang');
+}
+
+// ─── Fabric Loader: свежий стабильный из меты Fabric ─────────────────
+// Список отсортирован от новых к старым; берём первый stable, не ниже пина
+// FABRIC_LOADER. Удачный ответ кэшируем в userData — при недоступной мете
+// игрок запускается с тем, что уже стояло, а не откатывается на пин.
+const FABRIC_META_URL = 'https://meta.fabricmc.net/v2/versions/loader/' + MC_VERSION;
+function fabricLoaderCachePath() {
+  return path.join(app.getPath('userData'), 'fabric-loader.json');
+}
+let fabricLoaderResolved = null; // последняя выбранная версия за процесс
+async function resolveFabricLoader(dispatcher) {
+  let picked = null;
+  try {
+    const res = await fetch(FABRIC_META_URL, { dispatcher, signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const list = await res.json();
+    const stable = (Array.isArray(list) ? list : [])
+      .map((x) => x && x.loader)
+      .filter((l) => l && l.stable && typeof l.version === 'string' && mods.parseVer(l.version));
+    if (stable.length) {
+      picked = stable[0].version;
+      try { fs.writeFileSync(fabricLoaderCachePath(), JSON.stringify({ version: picked, at: Date.now() })); } catch (_) {}
+    }
+  } catch (e) {
+    logLine('ⓘ Мета Fabric недоступна (' + describeError(e).split('\n')[0] + ') — беру сохранённую версию loader');
+  }
+  if (!picked) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(fabricLoaderCachePath(), 'utf8'));
+      if (cached && typeof cached.version === 'string' && mods.parseVer(cached.version)) picked = cached.version;
+    } catch (_) { /* кэша ещё нет */ }
+  }
+  if (!picked || mods.cmpVer(picked, FABRIC_LOADER) < 0) picked = FABRIC_LOADER;
+  fabricLoaderResolved = picked;
+  VERSION_INFO.fabric = picked;
+  mods.setLoaderVersion('fabric', picked);
+  return picked;
 }
 
 // AggregateError от xmcl прячет реальные причины в .errors — разворачиваем в понятный текст.
@@ -618,6 +660,10 @@ app.whenReady().then(() => {
   // ранняя проба базы сайта (mistmc.gg или зеркало) — к моменту первого
   // хартбита/каталога выбор уже сделан
   site.getBase().catch(() => {});
+  // версия Fabric Loader нужна менеджеру модов ещё до первого запуска игры
+  // (установка из вкладки «Моды» сверяет требования джарников к лоадеру)
+  mods.setLoaderVersion('fabric', FABRIC_LOADER);
+  resolveFabricLoader().catch(() => {});
   setupAutoUpdate();
   translate.init(app.getPath('userData'));
   const cfg = loadConfig();
@@ -1339,11 +1385,12 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     // 2) Загрузчик модов
     let versionId = MC_VERSION;
     if (loader === 'fabric') {
-      status('Установка Fabric ' + FABRIC_LOADER);
-      logLine('▶ Установка Fabric ' + FABRIC_LOADER);
+      const fabricLoader = await resolveFabricLoader(dl.dispatcher);
+      status('Установка Fabric ' + fabricLoader);
+      logLine('▶ Установка Fabric ' + fabricLoader);
       versionId = await installer.installFabric({
         minecraftVersion: MC_VERSION,
-        version: FABRIC_LOADER,
+        version: fabricLoader,
         minecraft: mc,
         dispatcher: dl.dispatcher,
       });
@@ -1370,6 +1417,12 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     // честной сборкой Mist; без сети — усыпляются, играем без freecam
     try {
       await mods.enforceFairFreecam(gameDir, logLine);
+    } catch (_) { /* запуск важнее */ }
+    // 3.3) Запрещённые на сервере моды (JourneyMap) выключаем до входа —
+    // иначе игрока кикнет сервер, а причина останется непонятной
+    try {
+      const banned = mods.enforceBlockedMods(gameDir, logLine);
+      if (banned.length) logLine('⚑ ' + banned.join(', ') + ': на Mist MC запрещён, выключен перед запуском.');
     } catch (_) { /* запуск важнее */ }
 
     // 3.5) Серверный ресурспак (петы) с автообновлением по sha1 — запасной

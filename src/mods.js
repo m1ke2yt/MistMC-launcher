@@ -22,6 +22,23 @@ const USER_AGENT = 'MistMC-Launcher/1.2.0 (mistmc.gg)';
 // fabric-api / modmenu / cloth-config (project id с Modrinth).
 const BUNDLED_PROJECTS = new Set(['P7dR8mSH', 'mOgUt4GM', '9s6osm5g']);
 
+// Версия загрузчика, под которую ставим моды. main.js сообщает её после выбора
+// стабильного Fabric Loader (мета Fabric, см. resolveFabricLoader). Нужна, чтобы
+// не ставить джарник, который требует лоадер новее нашего: Fabric Language
+// Kotlin 1.14 (07.09.2026) хочет fabricloader >=0.19.5 — с прибитым 0.19.3
+// игра встречала новичка экраном «Incompatible mods found» прямо после установки.
+const loaderVersions = { fabric: null };
+function setLoaderVersion(loader, version) { loaderVersions[loader] = version || null; }
+
+/** Устраивает ли наш загрузчик требование fabric.mod.json (нет требования — да). */
+function fitsLoader(meta, loader) {
+  const have = loaderVersions[loader];
+  const need = meta && meta.depends && meta.depends.fabricloader;
+  if (loader !== 'fabric' || !have || !need) return true;
+  return satisfies(have, need);
+}
+function loaderNeed(meta) { return fmtConstraint((meta && meta.depends && meta.depends.fabricloader) || '*'); }
+
 const agent = new Agent({ connect: { timeout: 10000 }, headersTimeout: 15000, bodyTimeout: 300000 });
 
 // ── доступность Modrinth: прямой доступ + прокси-фолбэк через mistmc.gg ──
@@ -99,7 +116,13 @@ const BLOCK_PATTERNS = [
 const ANTI_RE = /anti.?(x[-_ ]?ray|free.?cam|cheat)/i;
 const BLOCK_SLUGS = new Set([
   'litematica-printer', // принтер режется античитом Mist MC
+  'journeymap', // пещерный режим карты сервером не закрывается — на Mist MC мод запрещён, сервер кикает
 ]);
+// Моды, которые лаунчер выключает перед запуском, даже если игрок закинул
+// джарник руками: по fabric-id и по имени файла (forge-сборки без fabric.mod.json).
+const BLOCKED_MODS = [
+  { ids: new Set(['journeymap']), fileRe: /journeymap/i, label: 'JourneyMap' },
+];
 const ALLOW_SLUGS = new Set(['legacyfreecam']);
 
 // «Freecam (Fair Play)» с Modrinth на деле собран ОБЫЧНЫМ вариантом мода:
@@ -462,14 +485,14 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
     return { ok: true, already: true };
   }
 
-  const version = await pickVersion(project.projectId, type, loader, mcVersion, pin);
+  let version = await pickVersion(project.projectId, type, loader, mcVersion, pin);
   if (!version) {
     return { ok: false, error: 'Нет сборки под ' + mcVersion + (type === 'mod' ? ' / ' + loader : '') };
   }
   if (existing && existing.versionId === version.id) {
     return { ok: true, already: true };
   }
-  const file = (version.files || []).find((f) => f.primary) || (version.files || [])[0];
+  let file = (version.files || []).find((f) => f.primary) || (version.files || [])[0];
   if (!file) return { ok: false, error: 'У версии нет файлов' };
 
   // замена несовместимой версии: сносим старый файл и запись
@@ -479,8 +502,32 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
   }
 
   fs.mkdirSync(contentDir(gameDir, type), { recursive: true });
-  const fileName = path.basename(file.filename).replace(/[\\/:*?"<>|]/g, '_');
+  const safeName = (f) => path.basename(f.filename).replace(/[\\/:*?"<>|]/g, '_');
+  let fileName = safeName(file);
   await downloadTo(file.url, path.join(contentDir(gameDir, type), fileName), log);
+
+  // Требование к самому загрузчику (Modrinth-deps его не знают, только
+  // fabric.mod.json): свежий релиз может хотеть лоадер новее нашего — тогда
+  // берём последнюю версию под наш loader, а не роняем игру на старте.
+  if (type === 'mod' && loader === 'fabric') {
+    const meta = fabricModInfo(path.join(contentDir(gameDir, type), fileName));
+    if (meta && !fitsLoader(meta, loader)) {
+      const need = loaderNeed(meta);
+      log('  ⚑ ' + (project.title || fileName) + ' ' + (version.version_number || '') + ' требует Fabric Loader '
+        + need + ', у нас ' + loaderVersions[loader] + ' — ищу версию под наш загрузчик');
+      try { fs.unlinkSync(path.join(contentDir(gameDir, type), fileName)); } catch (_) { /* уже нет */ }
+      const alt = await pickVersionForLoader(project.projectId, loader, mcVersion, version.id);
+      const altFile = alt && ((alt.files || []).find((f) => f.primary) || (alt.files || [])[0]);
+      if (!alt || !altFile) {
+        return { ok: false, error: 'Мод требует Fabric Loader ' + need + ' — обновите лаунчер' };
+      }
+      log('  → ' + (project.title || fileName) + ': ' + (version.version_number || '?') + ' → ' + (alt.version_number || '?'));
+      version = alt;
+      file = altFile;
+      fileName = safeName(file);
+      await downloadTo(file.url, path.join(contentDir(gameDir, type), fileName), log);
+    }
+  }
 
   // пины этой версии на другие проекты — пригодятся при будущих установках
   const depPins = {};
@@ -822,6 +869,57 @@ async function metaOfVersion(version) {
   return out;
 }
 
+/**
+ * Свежая версия проекта, чей fabric.mod.json устраивает наш загрузчик.
+ * Релизы раньше бет, внутри — от новых к старым; skipId — уже отвергнутая.
+ */
+async function pickVersionForLoader(projectId, loader, mcVersion, skipId) {
+  const versions = await listProjectVersions(projectId, loader, mcVersion);
+  const queue = versions.filter((v) => v.version_type === 'release')
+    .concat(versions.filter((v) => v.version_type !== 'release'))
+    .filter((v) => v.id !== skipId);
+  let probes = 0;
+  for (const v of queue) {
+    if (probes++ >= MAX_CANDIDATE_PROBES) break;
+    const meta = await metaOfVersion(v);
+    if (!meta) continue;
+    if (fitsLoader(meta, loader)) return v;
+  }
+  return null;
+}
+
+/**
+ * Уже стоящие моды, которым нужен загрузчик новее нашего, переставляем на
+ * версию под наш loader (кейс FLK 1.14 ↔ 0.19.3). Джарники, закинутые руками,
+ * не трогаем — только предупреждаем в журнале.
+ */
+async function enforceLoaderFit(gameDir, loader, mcVersion, log) {
+  if (loader !== 'fabric' || !loaderVersions[loader]) return;
+  const state = scanFabricState(gameDir, loader);
+  for (const { entry, info } of state.values()) {
+    if (fitsLoader(info, loader)) continue;
+    const need = loaderNeed(info);
+    if (!entry.projectId) {
+      log('⚠ ' + entry.fileName + ' требует Fabric Loader ' + need + ', у нас '
+        + loaderVersions[loader] + ' — файл закинут вручную, не трогаю');
+      continue;
+    }
+    log('⚑ ' + entry.title + ' ' + info.version + ' требует Fabric Loader ' + need
+      + ', у нас ' + loaderVersions[loader] + ' — подбираю версию под наш загрузчик');
+    const alt = await pickVersionForLoader(entry.projectId, loader, mcVersion, entry.versionId);
+    if (!alt) {
+      log('  ! версии под наш загрузчик нет — нужен свежий лаунчер');
+      continue;
+    }
+    await installContent(gameDir, {
+      projectId: entry.projectId,
+      slug: entry.slug,
+      title: entry.title,
+      iconUrl: entry.iconUrl || '',
+    }, 'mod', loader, mcVersion, log, 4, alt.id);
+  }
+}
+
 /** Активные моды: modid → { entry, info } по fabric.mod.json файла. */
 function scanFabricState(gameDir, loader) {
   const m = readManifest(gameDir);
@@ -953,6 +1051,9 @@ const MAX_CANDIDATE_PROBES = 8;
  */
 async function enforceJarDeps(gameDir, loader, mcVersion, log) {
   if (loader !== 'fabric') return;
+  // 0) моды, требующие загрузчик новее нашего — сначала они, иначе Fabric
+  // покажет «Incompatible mods found» ещё до разбора взаимных требований
+  await enforceLoaderFit(gameDir, loader, mcVersion, log);
   const locked = new Set();
 
   for (let pass = 0; pass < 6; pass++) {
@@ -1183,6 +1284,37 @@ async function enforceFairFreecam(gameDir, log) {
       writeManifest(gameDir, m);
     }
   }
+}
+
+/**
+ * Запрещённые на Mist MC моды (BLOCKED_MODS) усыпляем перед запуском:
+ * сервер всё равно кикнет за их каналы, лучше объяснить это до входа.
+ * Возвращает список выключенных ярлыков (для сообщения игроку).
+ */
+function enforceBlockedMods(gameDir, log) {
+  const dir = contentDir(gameDir, 'mod');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (_) { return []; }
+  const hit = [];
+  for (const f of names) {
+    if (!f.endsWith('.jar')) continue;
+    const full = path.join(dir, f);
+    let info = null;
+    try { info = fabricModInfo(full); } catch (_) { /* не fabric-джарник */ }
+    const rule = BLOCKED_MODS.find((r) => (info && r.ids.has(info.id)) || r.fileRe.test(f));
+    if (!rule) continue;
+    try {
+      fs.renameSync(full, full + '.banned.disabled');
+      const m = readManifest(gameDir);
+      const e = m.user.find((x) => x.type === 'mod' && x.fileName === f);
+      if (e) { e.enabled = false; writeManifest(gameDir, m); }
+      log('  − ' + f + ': ' + rule.label + ' запрещён на Mist MC — выключен');
+      hit.push(rule.label);
+    } catch (e) {
+      log('  ! не смог выключить ' + f + ': ' + e.message);
+    }
+  }
+  return hit;
 }
 
 /**
@@ -1463,6 +1595,8 @@ function collectClientInventory(gameDir, bundledDir, loader) {
 }
 
 module.exports = {
+  setLoaderVersion,
+  enforceBlockedMods,
   listContent,
   searchContent,
   popularContent,
