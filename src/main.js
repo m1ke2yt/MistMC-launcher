@@ -252,6 +252,20 @@ let fabricLoaderResolved = null; // последняя выбранная вер
 async function resolveFabricLoader(dispatcher) {
   let picked = null;
   try {
+    picked = await pickStableFabricLoader(dispatcher);
+  } catch (e) {
+    logLine('ⓘ Выбор версии Fabric Loader не удался (' + (e && e.message) + ') — беру встроенную ' + FABRIC_LOADER);
+    picked = null;
+  }
+  if (!picked) picked = FABRIC_LOADER;
+  fabricLoaderResolved = picked;
+  VERSION_INFO.fabric = picked;
+  mods.setLoaderVersion('fabric', picked);
+  return picked;
+}
+async function pickStableFabricLoader(dispatcher) {
+  let picked = null;
+  try {
     const res = await fetch(FABRIC_META_URL, { dispatcher, signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const list = await res.json();
@@ -271,10 +285,9 @@ async function resolveFabricLoader(dispatcher) {
       if (cached && typeof cached.version === 'string' && mods.parseVer(cached.version)) picked = cached.version;
     } catch (_) { /* кэша ещё нет */ }
   }
-  if (!picked || mods.cmpVer(picked, FABRIC_LOADER) < 0) picked = FABRIC_LOADER;
-  fabricLoaderResolved = picked;
-  VERSION_INFO.fabric = picked;
-  mods.setLoaderVersion('fabric', picked);
+  // cmpVer сравнивает РАЗОБРАННЫЕ версии (parseVer), не строки — на строках
+  // падало «Cannot read properties of undefined (reading '0')» (1.7.9, 15.09)
+  if (!picked || mods.cmpVer(mods.parseVer(picked), mods.parseVer(FABRIC_LOADER)) < 0) picked = FABRIC_LOADER;
   return picked;
 }
 
