@@ -1,0 +1,6 @@
+node_modules/
+release/
+resources/jre-win/
+resources/jre-linux/
+resources/mods/
+*.log

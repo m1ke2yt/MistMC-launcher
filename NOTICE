@@ -1,0 +1,11 @@
+Third-party components
+
+This launcher bundles and/or uses the following components. Their licenses apply
+to the respective parts.
+
+- Electron — MIT License. https://github.com/electron/electron
+- @xmcl/core, @xmcl/installer — MIT License. https://github.com/Voxelum/minecraft-launcher-core-node
+- electron-updater — MIT License. https://github.com/electron-userland/electron-builder
+- @xhayper/discord-rpc — MIT License. https://github.com/xhayper/discord-rpc
+- undici — MIT License. https://github.com/nodejs/undici
+- Eclipse Temurin JRE — GPLv2 with Classpath Exception. https://adoptium.net
