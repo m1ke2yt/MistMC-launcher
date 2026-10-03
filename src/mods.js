@@ -1939,6 +1939,39 @@ function disableModById(gameDir, loader, modId, log) {
   return null;
 }
 
+/**
+ * Моды с хранилищем «на одну игру». Базу на диске открывает только первый
+ * клиент; второй при входе на тот же сервер падает и намертво виснет на
+ * «Сохранении мира» (Voxy: RocksDB «Failed to create lock file»). Игре,
+ * которую запускают рядом с уже идущей, такие моды не грузим — вместе со
+ * всем, что без них не стартует. ids идут в -Dfabric.debug.disableModIds.
+ */
+const SINGLE_INSTANCE_MODS = new Map([['voxy', 'Voxy']]);
+function secondGameDisabledMods(gameDir) {
+  const infos = [];
+  try {
+    const dir = contentDir(gameDir, 'mod');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jar')) continue;
+      const info = fabricModInfo(path.join(dir, f));
+      if (info && info.id) infos.push(info);
+    }
+  } catch (_) { return { ids: [], labels: [] }; }
+  const off = new Map(); // id → название для журнала
+  for (const i of infos) {
+    if (SINGLE_INSTANCE_MODS.has(i.id)) off.set(i.id, SINGLE_INSTANCE_MODS.get(i.id));
+  }
+  for (let grew = off.size > 0; grew;) {
+    grew = false;
+    for (const i of infos) {
+      if (off.has(i.id) || !Object.keys(i.depends).some((d) => off.has(d))) continue;
+      off.set(i.id, i.name || i.id);
+      grew = true;
+    }
+  }
+  return { ids: [...off.keys()], labels: [...off.values()] };
+}
+
 // ── сборка игрока: экспорт кодом и применение ───────────────────────────
 // ── настройки внутри кода сборки ────────────────────────────────────────
 // Кроме списка модов код может нести НЕЛИЧНЫЕ настройки: config/ (параметры
@@ -2493,6 +2526,7 @@ module.exports = {
   toggleBundledMod,
   removeUserContent,
   disableModById,
+  secondGameDisabledMods,
   syncMods,
   enforceJarDeps,
   enforceFairFreecam,

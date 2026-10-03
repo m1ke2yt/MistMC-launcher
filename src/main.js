@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, shell, dialog, safeStorage, protocol, net }
 const { pathToFileURL } = require('url');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 
 const { launch, Version, MinecraftFolder, createMinecraftProcessWatcher, DEFAULT_EXTRA_JVM_ARGS } = require('@xmcl/core');
@@ -118,7 +119,9 @@ const SERVER_HOST = 'mistmc.gg';  // адрес сервера для игрок
 // Автоподключение идёт по фактическому эндпоинту: по хосту в хендшейке сервер
 // отличает вход через лаунчер от ручного входа по mistmc.gg (метрика в админке).
 // В сборке из исходников эндпоинта нет — подключаемся по общему адресу.
-const JOIN_HOST = buildSecret.NET.joinHost || SERVER_HOST;
+// MISTMC_JOIN_HOST — только для запуска из исходников: проверить автоподключение
+// на локальном тестовом сервере, не трогая боевой.
+const JOIN_HOST = (!app.isPackaged && process.env.MISTMC_JOIN_HOST) || buildSecret.NET.joinHost || SERVER_HOST;
 // MISTMC_SITE_URL — для локальной отладки против dev-сервера сайта
 const SITE_URL = process.env.MISTMC_SITE_URL || 'https://mistmc.gg';
 const MS_CLIENT_ID = buildSecret.MS_CLIENT_ID || ''; // Azure App; в сборке из исходников пусто
@@ -1425,6 +1428,16 @@ function otherRunningGames() {
   }
   return out;
 }
+// Сколько памяти дать игре, когда в соседнем окне уже идёт другая. Две игры
+// с полным ползунком вдвоём в ОЗУ не помещаются: вторая падает с Out of memory
+// посреди мира — экран «Сохранение мира» и намертво зависшее окно.
+// Возвращает урезанный объём, а если не влезает и минимум — 0.
+function heapForSecondGame(ramMb, freeMb) {
+  const reserve = 1024;
+  if (ramMb <= freeMb - reserve) return ramMb;
+  const fit = Math.floor((freeMb - reserve) / 256) * 256;
+  return fit >= 2048 ? fit : 0;
+}
 
 // Пускает ли сервер клиента этой версии игры (итог последней проверки перед
 // запуском): окно по нему заранее пишет, получится ли зайти на Mist MC.
@@ -2014,6 +2027,30 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       mods.collectClientInventory(gameDir, modsResourceDir(), loader, mcVersion));
     logLine('▶ Запуск версии ' + versionId + ' от имени ' + account.name
       + (account.userType === 'msa' ? ' (Microsoft)' : ' (по нику)'));
+    const freeMb = Math.floor(os.freemem() / 1048576);
+    logLine('ⓘ Память: игре ' + ram + ' МБ, на компьютере свободно ' + freeMb
+      + ' из ' + Math.floor(os.totalmem() / 1048576) + ' МБ');
+    let heap = ram;
+    const secondGameArgs = [];
+    if (otherRunningGames().length) {
+      // моды, чьё хранилище держит первая игра, этой не грузим — иначе она
+      // упадёт при входе на сервер и зависнет на «Сохранении мира»
+      const off = loader === 'fabric' ? mods.secondGameDisabledMods(gameDir) : { ids: [] };
+      if (off.ids.length) {
+        secondGameArgs.push('-Dfabric.debug.disableModIds=' + off.ids.join(','));
+        logLine('ⓘ В другом окне уже идёт игра — в этой выключено: ' + off.labels.join(', ')
+          + ' (не умеет работать в двух играх сразу).');
+      }
+      const fit = heapForSecondGame(ram, freeMb);
+      if (fit && fit < ram) {
+        heap = fit;
+        logLine('ⓘ В другом окне уже идёт игра — этой выделено ' + heap + ' МБ вместо ' + ram
+          + ', чтобы обе поместились в память.');
+      } else if (!fit) {
+        logLine('⚠ В другом окне уже идёт игра, а свободной памяти всего ' + freeMb
+          + ' МБ — вторая игра может зависнуть. Закрой лишние программы или уменьши память в настройках.');
+      }
+    }
     const proc = await launch({
       gamePath: gameDir,
       javaPath,
@@ -2021,8 +2058,8 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       gameProfile: { name: account.name, id: account.uuid },
       accessToken: account.accessToken,
       userType: account.userType,
-      minMemory: Math.min(process.arch === 'ia32' ? 512 : 1024, ram),
-      maxMemory: ram,
+      minMemory: Math.min(process.arch === 'ia32' ? 512 : 1024, heap),
+      maxMemory: heap,
       launcherName: 'MistMC',
       launcherBrand: 'MistMC',
       versionType: 'Mist MC',
@@ -2033,6 +2070,7 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       extraJVMArgs: [
         ...DEFAULT_EXTRA_JVM_ARGS.filter((v) => v !== '-Xmx2G'),
         ...(await mojangArgsPromise),
+        ...secondGameArgs,
       ],
     });
     gameProc = proc; // пока жив — закрытие окна не завершает лаунчер
@@ -2041,8 +2079,30 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     // Логи процесса (кратко) + хвост для разбора краша: если игра упала из-за
     // мижина стороннего мода, по этому хвосту находим виновника
     let gameLogTail = '';
+    // Упавшая игра не всегда закрывается сама: мод может намертво зависнуть на
+    // уборке после краша (так делает Voxy), и на экране навсегда остаётся
+    // «Сохранение мира». Жива через 20 секунд после фатальной ошибки — закрываем.
+    let oomTold = false;
+    let crashSeen = false;
     const keepTail = (chunk) => {
       gameLogTail = (gameLogTail + chunk).slice(-65536);
+      // строки чата не в счёт: там эти слова может написать любой игрок
+      const lines = chunk.split('\n').filter((l) => !l.includes('[CHAT]'));
+      if (!oomTold && lines.some((l) => /java\.lang\.OutOfMemoryError/.test(l))) {
+        oomTold = true;
+        const free = Math.floor(os.freemem() / 1048576);
+        const advice = free < 1024
+          ? 'на компьютере кончилась свободная память (' + free + ' МБ). Закрой вторую игру или лишние программы'
+          : 'ей выделено ' + heap + ' МБ. Добавь память в настройках лаунчера';
+        logLine('⚑ Игре не хватило памяти: ' + advice + ', затем перезапусти игру.');
+      }
+      if (crashSeen || !lines.some((l) => /Unreported exception thrown!|---- Minecraft Crash Report ----/.test(l))) return;
+      crashSeen = true;
+      setTimeout(() => {
+        if (gameProc !== proc || proc.exitCode !== null) return;
+        logLine('⚑ Игра упала и зависла, не закрывшись — закрываю её. Причина — выше в журнале.');
+        try { proc.kill(); } catch (_) { /* уже вышла */ }
+      }, 20000);
     };
     if (proc.stdout) proc.stdout.on('data', (d) => { const s = d.toString(); keepTail(s); logLine(s.trimEnd()); });
     if (proc.stderr) proc.stderr.on('data', (d) => { const s = d.toString(); keepTail(s); logLine(s.trimEnd()); });
