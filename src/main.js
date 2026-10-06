@@ -277,7 +277,47 @@ async function fetchVersionList(dispatcher) {
 // Список отсортирован от новых к старым; берём первый stable, не ниже пина
 // FABRIC_LOADER. Удачный ответ кэшируем в userData — при недоступной мете
 // игрок запускается с тем, что уже стояло, а не откатывается на пин.
-const FABRIC_META_URL = 'https://meta.fabricmc.net/v2/versions/loader/';
+// Мета Fabric стоит за Cloudflare, у части провайдеров соединение с ней рвётся
+// ещё на TLS («SSL alert number 40», живой кейс 06.10) — запасным идёт то же
+// API на bmclapi: ответы совпадают с официальными, отличаются только метки времени.
+const FABRIC_META_HOSTS = ['https://meta.fabricmc.net', 'https://bmclapi2.bangbang93.com/fabric-meta'];
+async function fetchFabricMeta(pathname, dispatcher, timeoutMs) {
+  const errors = [];
+  for (const host of FABRIC_META_HOSTS) {
+    try {
+      const res = await fetch(host + pathname, { dispatcher, signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return await res.json();
+    } catch (e) {
+      errors.push(e);
+    }
+  }
+  throw new AggregateError(errors, 'Мета Fabric недоступна');
+}
+function isFabricProfile(json) {
+  return !!json && typeof json.mainClass === 'string' && typeof json.inheritsFrom === 'string' &&
+    Array.isArray(json.libraries) && json.libraries.length > 0;
+}
+// Профиль версии «<игра>-fabric<loader>». installFabric из xmcl качает его с
+// меты при КАЖДОМ запуске, одним хостом и мимо dispatcher — без меты не
+// запускалась и уже установленная игра. Профиль пары «игра + loader» не
+// меняется, поэтому лежащий на диске берём без сети.
+async function installFabricProfile(mcVersion, loaderVersion, folder, dispatcher) {
+  const versionName = mcVersion + '-fabric' + loaderVersion;
+  const jsonPath = folder.getVersionJson(versionName);
+  try {
+    const saved = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    if (saved.id === versionName && saved.inheritsFrom === mcVersion && isFabricProfile(saved)) return versionName;
+  } catch (_) { /* профиля ещё нет или он битый — качаем */ }
+  const content = await fetchFabricMeta(
+    '/v2/versions/loader/' + encodeURIComponent(mcVersion) + '/' + encodeURIComponent(loaderVersion) + '/profile/json',
+    dispatcher, 20000);
+  if (!isFabricProfile(content)) throw new Error('Мета Fabric вернула не профиль версии');
+  content.id = versionName;
+  fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
+  fs.writeFileSync(jsonPath, JSON.stringify(content));
+  return versionName;
+}
 function fabricLoaderCachePath() {
   return path.join(app.getPath('userData'), 'fabric-loader.json');
 }
@@ -299,9 +339,7 @@ async function resolveFabricLoader(dispatcher, mc = MC_VERSION) {
 async function pickStableFabricLoader(dispatcher, mc) {
   let picked = null;
   try {
-    const res = await fetch(FABRIC_META_URL + encodeURIComponent(mc), { dispatcher, signal: AbortSignal.timeout(10000) });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const list = await res.json();
+    const list = await fetchFabricMeta('/v2/versions/loader/' + encodeURIComponent(mc), dispatcher, 10000);
     const stable = (Array.isArray(list) ? list : [])
       .map((x) => x && x.loader)
       .filter((l) => l && l.stable && typeof l.version === 'string' && mods.parseVer(l.version));
@@ -1915,12 +1953,7 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       const fabricLoader = await resolveFabricLoader(dl.dispatcher, mcVersion);
       status('Установка Fabric ' + fabricLoader);
       logLine('▶ Установка Fabric ' + fabricLoader);
-      versionId = await installer.installFabric({
-        minecraftVersion: mcVersion,
-        version: fabricLoader,
-        minecraft: mc,
-        dispatcher: dl.dispatcher,
-      });
+      versionId = await installFabricProfile(mcVersion, fabricLoader, mc, dl.dispatcher);
       const resolved = await Version.parse(gameDir, versionId);
       await runTask('Загрузка библиотек Fabric', installer.installDependenciesTask(resolved, dl));
     } else if (loader === 'forge') {
