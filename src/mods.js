@@ -76,11 +76,19 @@ function describeEnv(mis) {
  * То же для джарника, закинутого руками: помимо заявленного в fabric.mod.json
  * проверяем, под какую эпоху игры он собран (см. usesIntermediary). Моды из
  * каталога эту проверку не проходят — их версию игры знает Modrinth.
+ *
+ * Явному требованию к игре верим больше, чем классам: если оно отсекает
+ * 1.21.11 (а выбранную версию пропускает — иначе сюда не дошли бы), джарник
+ * собран под 26.x. У Bendable Cuboids под 26.x («minecraft >=26.3») в миксинах
+ * к PlayerAnimationLib цель записана дважды, вторым вариантом — со старым
+ * именем net/minecraft/class_630; это строка в аннотации, а не ссылка на класс.
  */
 function fileEnvMismatch(file, meta, loader, mc) {
   const mis = envMismatch(meta, loader, mc);
-  if (mis || loader !== 'fabric' || !unobfuscatedMc(mc) || !usesIntermediary(file)) return mis;
-  return { id: 'minecraft', need: BUNDLED_MC + ' и старше', have: mc };
+  if (mis || loader !== 'fabric' || !unobfuscatedMc(mc)) return mis;
+  const need = meta && meta.depends ? meta.depends.minecraft : undefined;
+  if (need !== undefined && !satisfies(BUNDLED_MC, need)) return null;
+  return usesIntermediary(file) ? { id: 'minecraft', need: BUNDLED_MC + ' и старше', have: mc } : null;
 }
 
 /** Версии игры, под которые годится запись реестра (заявлены на Modrinth). */
