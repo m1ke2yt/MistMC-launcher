@@ -3334,17 +3334,23 @@ els.mcSelect.addEventListener('change', async () => {
     els.status.textContent = (res && res.error) || 'Не удалось сменить версию игры';
     return;
   }
+  applyGameVersion(res);
+  els.status.textContent = 'Версия игры: ' + state.mc
+    + (res.notes && res.notes.length ? ' · ' + res.notes.join(' · ') : '');
+});
+
+/** Версия игры сменилась (выбором в окне или под мир друга) — всё, что от неё зависит. */
+function applyGameVersion(res) {
   state.mc = res.mcVersion;
   state.versionInfo = res.versionInfo || state.versionInfo;
   if (res.joinKnown === true || res.joinKnown === false) state.joinKnown[state.mc] = res.joinKnown;
+  els.mcSelect.value = state.mc;
   updateVersionUI();
   // каталог и набор модов у каждой версии игры свои — вкладка «Моды» перечитается
   state.lastHits = [];
   state.modsReport = null;
   els.secResults.hidden = true;
-  els.status.textContent = 'Версия игры: ' + state.mc
-    + (res.notes && res.notes.length ? ' · ' + res.notes.join(' · ') : '');
-});
+}
 
 els.btnDir.addEventListener('click', async () => {
   const dir = await window.api.pickDir();
@@ -3465,6 +3471,14 @@ if (window.api.onJoinSupport) {
 }
 // набор модов поменялся не из окна: игра попросила доставить моды друга
 if (window.api.onModsChanged) window.api.onModsChanged(() => refreshModsView(true));
+// игра попросила перезапустить её на версии друга — выбор версии в окне следует за ней
+if (window.api.onGameVersionChanged) {
+  window.api.onGameVersionChanged((d) => {
+    if (!d || !d.mcVersion || d.mcVersion === state.mc) return;
+    applyGameVersion(d);
+    refreshModsView(true);
+  });
+}
 // Мягкое обновление: одна кнопка в футере. Пока качается — показывает процент;
 // клик в любой момент = «обнови и перезапусти» (тихая установка без мастера NSIS).
 let updClicked = false;

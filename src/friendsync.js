@@ -12,7 +12,9 @@
 //   игра → { t: 'hello', token }
 //   игра → { t: 'sync', host, mc, mods: [{ id, n, v, h }] }
 //   лаунчер → { t: 'progress', done, total, name } … { t: 'result', installed, failed, restart }
-//   игра → { t: 'restart', join }      лаунчер → { t: 'restart_ok' }
+//   игра → { t: 'restart', join, mc }  лаунчер → { t: 'restart_ok' }
+// mc — версия игры друга, если она не та, что запущена: лаунчер перезапустит
+// игру уже на ней.
 // На любую неудачу лаунчер отвечает { t: 'error', text }.
 
 const net = require('net');
@@ -73,7 +75,7 @@ async function onMessage(msg, reply) {
       busy = false;
     }
   } else if (msg.t === 'restart') {
-    handlers.restart({ join: clip(msg.join, 16) });
+    handlers.restart({ join: clip(msg.join, 16), mc: clip(msg.mc, 24) });
     reply({ t: 'restart_ok' });
   } else {
     throw new Error('Неизвестная просьба: ' + clip(msg.t, 24));
@@ -122,7 +124,7 @@ function onConnection(sock) {
  * Возвращает значение для MIST_LAUNCHER_IPC или null, если порт открыть не
  * удалось — игра тогда просто не предложит ставить моды.
  *   h.sync({ host, mc, mods }, progress) → { installed: [название], failed: [{ name, why }] }
- *   h.restart({ join })
+ *   h.restart({ join, mc })
  */
 async function issue(h) {
   handlers = h;

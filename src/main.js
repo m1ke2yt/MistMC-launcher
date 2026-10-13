@@ -1836,8 +1836,9 @@ let launching = false;
 // Моды для входа в мир друга. Мод MistSocial в игре находит у друга моды,
 // которых нет у игрока, и просит лаунчер их поставить (см. friendsync.js);
 // затем игра закрывается, а мы запускаем её снова и говорим моду, к кому зайти.
+// Так же меняется версия игры, если у друга она другая: перезапуск идёт на ней.
 let lastLaunch = null;     // чем запущена текущая игра: { opts, gameDir, loader, mcVersion }
-let friendRelaunch = null; // { join, at } — игра попросила перезапустить её и зайти к другу
+let friendRelaunch = null; // { join, mc, at } — игра попросила перезапустить её и зайти к другу
 const FRIEND_RELAUNCH_TTL = 5 * 60e3;
 const friendHandlers = {
   async sync({ host, mods: wanted }, progress) {
@@ -1851,11 +1852,26 @@ const friendHandlers = {
     send('mods-changed');
     return res;
   },
-  restart({ join }) {
+  restart({ join, mc }) {
     if (!lastLaunch || !gameRunning()) throw new Error('Игра запущена не этим окном лаунчера.');
     if (!NICK_RE.test(join)) throw new Error('Некорректный ник друга.');
-    friendRelaunch = { join, at: Date.now() };
-    logLine('ⓘ Игра перезапустится и зайдёт в мир ' + join + '.');
+    // Версия игры друга. Отказываем сейчас, пока игра ещё открыта: после её
+    // закрытия игрок остался бы без игры и без объяснения.
+    let switchTo = null;
+    if (mc && mc !== lastLaunch.mcVersion) {
+      const v = versions.gameVersions().find((x) => x.id === mc);
+      if (!v) throw new Error('В лаунчере нет Minecraft ' + mc + '.');
+      if (!v.supported) throw new Error(v.reason);
+      if (lastLaunch.loader !== 'fabric' || !mods.hasBundled(modsResourceDir(), mc)) {
+        throw new Error('Под Minecraft ' + mc + ' нет мода друзей Mist MC.');
+      }
+      if (otherRunningGames().some((x) => x && x !== mc)) {
+        throw new Error('В другом окне лаунчера идёт игра — версию можно сменить после её закрытия.');
+      }
+      switchTo = mc;
+    }
+    friendRelaunch = { join, mc: switchTo, at: Date.now() };
+    logLine('ⓘ Игра перезапустится' + (switchTo ? ' на Minecraft ' + switchTo : '') + ' и зайдёт в мир ' + join + '.');
   },
 };
 
@@ -2229,8 +2245,23 @@ async function launchGame(opts) {
       const again = friendRelaunch;
       friendRelaunch = null;
       if (again && Date.now() - again.at < FRIEND_RELAUNCH_TTL) {
-        logLine('▶ Перезапуск игры с новыми модами, вход в мир ' + again.join);
-        launchGame({ ...opts, friendJoin: again.join }).then((r) => {
+        if (again.mc) {
+          // версия игры друга становится выбранной, как если бы её выбрали в окне
+          logLine('▶ Перезапуск игры на Minecraft ' + again.mc + ', вход в мир ' + again.join);
+          const cfg = loadConfig();
+          cfg.mcVersion = again.mc;
+          saveConfig(cfg);
+          send('game-version-changed', {
+            mcVersion: again.mc,
+            versionInfo: { ...versionInfoFor(again.mc), launcher: app.getVersion() },
+            joinKnown: joinSupport.has(again.mc) ? joinSupport.get(again.mc) : null,
+          });
+          // новая версия может качаться несколько минут — показываем окно с ходом загрузки
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.restore();
+        } else {
+          logLine('▶ Перезапуск игры с новыми модами, вход в мир ' + again.join);
+        }
+        launchGame({ ...opts, mcVersion: again.mc || mcVersion, friendJoin: again.join }).then((r) => {
           if (r && r.ok) return;
           send('launch-error', (r && r.error) || 'игра не перезапустилась');
           if (mainWindow && !mainWindow.isDestroyed()) mainWindow.restore();

@@ -64,6 +64,7 @@ contextBridge.exposeInMainWorld('api', {
   onAuthExpired: (cb) => ipcRenderer.on('auth-expired', () => cb()),
   onJoinSupport: (cb) => ipcRenderer.on('join-support', (_e, d) => cb(d)),
   onModsChanged: (cb) => ipcRenderer.on('mods-changed', () => cb()),
+  onGameVersionChanged: (cb) => ipcRenderer.on('game-version-changed', (_e, d) => cb(d)),
   onUpdateState: (cb) => ipcRenderer.on('update-state', (_e, d) => cb(d)),
   updateRestart: () => ipcRenderer.send('update-restart'),
 });
