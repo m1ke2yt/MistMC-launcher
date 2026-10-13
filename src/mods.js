@@ -750,8 +750,9 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
     }
   }
   // жёсткие требования из fabric.mod.json (Modrinth-deps их не знают):
-  // только на верхнем уровне — enforceJarDeps сам ставит версии с depth 4
-  if (depth === 0 && type === 'mod') {
+  // только на верхнем уровне — enforceJarDeps сам ставит версии с depth 4;
+  // deferDeps — ставим пачку модов, проверку вызывающий сделает один раз в конце
+  if (depth === 0 && type === 'mod' && !opts.deferDeps) {
     try { await enforceJarDeps(gameDir, loader, mcVersion, log); } catch (_) { /* сеть */ }
   }
   return { ok: true };
@@ -1805,20 +1806,23 @@ function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC) {
   // Дубликаты mod id валят Fabric на старте («Duplicate mod id») ещё до окна
   // игры: игрок положил свой fabric-api/modmenu, а мы докинули вшитый той же
   // сути. Оставляем вшитый (он подобран под сборку Mist), копию игрока
-  // усыпляем в .dupe.disabled — вернуть можно переименованием.
+  // усыпляем в .dupe.disabled — вернуть можно переименованием. Из двух
+  // невшитых остаётся поставленный лаунчером: его версию подбирали (под
+  // соседние моды или под мир друга), а закинутый руками — какой был.
   if (loader === 'fabric') {
     const dir = contentDir(gameDir, 'mod');
-    const byId = new Map(); // id → [{file, bundled}]
+    const managed = new Set(m.user.filter((e) => e.type === 'mod' && !e.pendingRemove).map((e) => e.fileName));
+    const byId = new Map(); // id → [{file, bundled, managed}]
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.jar')) continue;
       const info = fabricModInfo(path.join(dir, f));
       if (!info || !info.id) continue;
       if (!byId.has(info.id)) byId.set(info.id, []);
-      byId.get(info.id).push({ file: f, bundled: bundled.includes(f) });
+      byId.get(info.id).push({ file: f, bundled: bundled.includes(f), managed: managed.has(f) });
     }
     for (const [id, files] of byId) {
       if (files.length < 2) continue;
-      const keep = files.find((x) => x.bundled) || files[0];
+      const keep = files.find((x) => x.bundled) || files.find((x) => x.managed) || files[0];
       for (const x of files) {
         if (x === keep) continue;
         try {
@@ -2181,6 +2185,179 @@ async function applyBuild(gameDir, build, mcVersion, log, parts) {
   return summary;
 }
 
+// ── моды для входа в мир друга (MistSocial) ─────────────────────────────
+// Мод в игре присылает моды хозяина мира, которых у игрока нет: fabric-id,
+// название, версию и sha1 джарника. Ставим те же версии, что у друга, — по
+// хэшу файла Modrinth находит версию точно. Адресов для скачивания от друга
+// не принимаем: всё идёт через каталог, со всеми запретами сервера.
+
+async function apiPost(pathname, body) {
+  const res = await fetch(API + pathname, {
+    method: 'POST',
+    headers: { 'User-Agent': USER_AGENT, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    dispatcher: agent,
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error('Modrinth HTTP ' + res.status);
+  return res.json();
+}
+
+const notFound = (e) => /HTTP 404/.test(String(e && e.message));
+
+/** Версии Modrinth по sha1 файлов: { sha1: version }. Чего в каталоге нет, того нет и в ответе. */
+async function versionsByHash(hashes) {
+  if (!hashes.length) return {};
+  try {
+    return (await apiPost('/version_files', { hashes, algorithm: 'sha1' })) || {};
+  } catch (_) {
+    // запасной канал (прокси сайта) умеет только GET — спрашиваем по одному
+    const out = {};
+    for (const h of hashes) {
+      try {
+        out[h] = await apiGet(API + '/version_file/' + h + '?algorithm=sha1');
+      } catch (e) {
+        // «такого файла нет» — обычный ответ, всё остальное — Modrinth недоступен
+        if (!notFound(e)) throw e;
+      }
+    }
+    return out;
+  }
+}
+
+async function projectsById(ids) {
+  const out = new Map();
+  for (let i = 0; i < ids.length; i += 80) {
+    const list = await apiGet(API + '/projects?ids=' + encodeURIComponent(JSON.stringify(ids.slice(i, i + 80))));
+    for (const p of Array.isArray(list) ? list : []) out.set(p.id, p);
+  }
+  return out;
+}
+
+/**
+ * Мод, которого нет в каталоге по хэшу (друг скачал его не с Modrinth или
+ * файл пересобран): ищем проект, названный как fabric-id мода, и берём сборку
+ * с тем же номером версии, а если такой нет — свежую. Чужой проект с похожим
+ * именем отсекает проверка: внутри джарника должен быть мод с этим id.
+ */
+async function findByModId(want, loader, mc) {
+  const core = String(want.version || '').split('+')[0];
+  for (const slug of new Set([want.id, want.id.replace(/_/g, '-')])) {
+    let project;
+    try {
+      project = await apiGet(API + '/project/' + encodeURIComponent(slug));
+    } catch (e) {
+      if (notFound(e)) continue;
+      throw e;
+    }
+    if (!project || project.project_type !== 'mod') continue;
+    const versions = await listProjectVersions(project.id, loader, mc);
+    const version = versions.find((v) => v.version_number === want.version)
+      || (core && versions.find((v) => guessModVersion(v.version_number, mc, v.game_versions) === core))
+      || versions.find((v) => v.version_type === 'release') || versions[0];
+    if (!version) continue;
+    const meta = await metaOfVersion(version);
+    if (meta && providesId(meta, want.id)) return { project, version };
+  }
+  return null;
+}
+
+/** Вшитый мод сборки с таким fabric-id, который игрок выключил: имя джарника или null. */
+function disabledBundled(gameDir, loader, mc, modId) {
+  const mine = bundledFor(bundledDirSeen, loader, mc);
+  if (!mine.dir) return null;
+  for (const f of readManifest(gameDir).bundledDisabled) {
+    const info = mine.jars.includes(f) ? fabricModInfo(path.join(mine.dir, f)) : null;
+    if (info && providesId(info, modId)) return f;
+  }
+  return null;
+}
+
+/**
+ * Поставить моды, без которых не зайти в мир друга.
+ *   wanted — [{ id, name, version, sha1 }] (см. friendsync.js)
+ *   onProgress(готово, всего, название)
+ * Возвращает { installed: [название], failed: [{ name, why }] }. Игра в это
+ * время идёт: новые джарники просто ложатся в папку, а заменяемые удалит
+ * syncMods перед следующим запуском.
+ */
+async function installForFriend(gameDir, loader, mc, wanted, log, onProgress) {
+  const installed = [];
+  const failed = [];
+  const step = (i, name) => { try { onProgress(i, wanted.length, name); } catch (_) { /* игра ушла */ } };
+  if (loader !== 'fabric') {
+    return { installed, failed: wanted.map((w) => ({ name: w.name, why: 'игра запущена без Fabric' })) };
+  }
+  step(0, '');
+  let byHash;
+  let projects;
+  try {
+    byHash = await versionsByHash(wanted.map((w) => w.sha1).filter(Boolean));
+    projects = await projectsById([...new Set(Object.values(byHash).map((v) => v && v.project_id).filter(Boolean))]);
+  } catch (e) {
+    return { installed, failed: wanted.map((w) => ({ name: w.name, why: 'Modrinth не отвечает' })) };
+  }
+
+  for (let i = 0; i < wanted.length; i++) {
+    const w = wanted[i];
+    step(i, w.name);
+    try {
+      // выключенный самим игроком — включаем обратно, качать нечего
+      const bundledOff = disabledBundled(gameDir, loader, mc, w.id);
+      if (bundledOff) {
+        toggleBundledMod(gameDir, bundledOff, true);
+        log('  + ' + bundledOff + ' включён обратно: нужен для мира друга');
+        installed.push(w.name);
+        continue;
+      }
+      const off = disabledProvider(gameDir, loader, mc, w.id);
+      if (off) {
+        const r = toggleUserContent(gameDir, 'mod', off.fileName, true);
+        if (r.ok) {
+          log('  + ' + off.title + ' включён обратно: нужен для мира друга');
+          installed.push(w.name);
+          continue;
+        }
+      }
+
+      let version = w.sha1 ? byHash[w.sha1] : null;
+      let project = version ? projects.get(version.project_id) : null;
+      // сборка друга под другой загрузчик или версию игры нам не подойдёт
+      if (version && (!project || project.project_type !== 'mod' || !(version.loaders || []).includes(loader)
+          || !(version.game_versions || []).includes(mc))) {
+        version = null;
+      }
+      if (!version) {
+        const found = await findByModId(w, loader, mc);
+        if (found) ({ project, version } = found);
+      }
+      if (!version) {
+        failed.push({ name: w.name, why: 'нет на Modrinth' });
+        log('  ! ' + w.name + ' ' + w.version + ': на Modrinth не найден');
+        continue;
+      }
+      const r = await installContent(gameDir, {
+        projectId: project.id,
+        slug: project.slug,
+        title: project.title,
+        iconUrl: project.icon_url || '',
+        description: project.description || '',
+      }, 'mod', loader, mc, log, 0, version.id, { deferDeps: true });
+      if (r && r.ok) installed.push(w.name);
+      else failed.push({ name: w.name, why: (r && r.error) || 'не установился' });
+    } catch (e) {
+      failed.push({ name: w.name, why: 'не скачался: ' + (e && e.message ? e.message : 'ошибка сети') });
+      log('  ! ' + w.name + ': ' + (e && e.message ? e.message : e));
+    }
+  }
+  step(wanted.length, '');
+  // требования новых модов друг к другу и к уже стоящим — один раз на всю пачку
+  if (installed.length) {
+    try { await enforceJarDeps(gameDir, loader, mc, log); } catch (_) { /* доделает проверка перед запуском */ }
+  }
+  return { installed, failed };
+}
+
 // ── подсказки и выбор версий для вкладки «Моды» ─────────────────────────
 function modTitle(slot) { return slot.entry.title || slot.info.name || slot.info.id; }
 
@@ -2522,6 +2699,7 @@ module.exports = {
   popularContent,
   projectDetails,
   installContent,
+  installForFriend,
   toggleUserContent,
   toggleBundledMod,
   removeUserContent,

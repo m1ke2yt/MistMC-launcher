@@ -3463,6 +3463,8 @@ if (window.api.onJoinSupport) {
     updateVersionUI();
   });
 }
+// набор модов поменялся не из окна: игра попросила доставить моды друга
+if (window.api.onModsChanged) window.api.onModsChanged(() => refreshModsView(true));
 // Мягкое обновление: одна кнопка в футере. Пока качается — показывает процент;
 // клик в любой момент = «обнови и перезапусти» (тихая установка без мастера NSIS).
 let updClicked = false;

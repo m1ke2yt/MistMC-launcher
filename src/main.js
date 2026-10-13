@@ -23,6 +23,7 @@ const site = require('./site');
 const versions = require('./versions');
 const buildSecret = require('./build-secret');
 const filelog = require('./filelog');
+const friendsync = require('./friendsync');
 
 // Файловый лог — раньше всего остального: падения на старте должны попасть
 // в журнал, даже если окно так и не открылось.
@@ -1832,7 +1833,37 @@ ipcMain.handle('build-apply', async (_e, arg) => {
 
 let launching = false;
 
-ipcMain.handle('launch-game', async (_e, opts) => {
+// Моды для входа в мир друга. Мод MistSocial в игре находит у друга моды,
+// которых нет у игрока, и просит лаунчер их поставить (см. friendsync.js);
+// затем игра закрывается, а мы запускаем её снова и говорим моду, к кому зайти.
+let lastLaunch = null;     // чем запущена текущая игра: { opts, gameDir, loader, mcVersion }
+let friendRelaunch = null; // { join, at } — игра попросила перезапустить её и зайти к другу
+const FRIEND_RELAUNCH_TTL = 5 * 60e3;
+const friendHandlers = {
+  async sync({ host, mods: wanted }, progress) {
+    if (!lastLaunch || !gameRunning()) throw new Error('Игра запущена не этим окном лаунчера.');
+    // версию игры берём свою: просит та самая игра, которую мы запустили
+    const { gameDir, loader, mcVersion } = lastLaunch;
+    if (loader !== 'fabric') throw new Error('Моды ставятся только в игру с Fabric.');
+    logLine('▶ Моды для входа в мир ' + (NICK_RE.test(host) ? host : 'друга') + ': ' + wanted.length);
+    const res = await mods.installForFriend(gameDir, loader, mcVersion, wanted, logLine, progress);
+    logLine('  итог: установлено ' + res.installed.length + ', не получилось ' + res.failed.length);
+    send('mods-changed');
+    return res;
+  },
+  restart({ join }) {
+    if (!lastLaunch || !gameRunning()) throw new Error('Игра запущена не этим окном лаунчера.');
+    if (!NICK_RE.test(join)) throw new Error('Некорректный ник друга.');
+    friendRelaunch = { join, at: Date.now() };
+    logLine('ⓘ Игра перезапустится и зайдёт в мир ' + join + '.');
+  },
+};
+
+ipcMain.handle('launch-game', (_e, opts) => launchGame(opts));
+
+// opts — то же, что присылает окно; friendJoin — ник друга, в чей мир игра
+// зайдёт сама (перезапуск после установки его модов)
+async function launchGame(opts) {
   // Дев-проверка фонового режима БЕЗ реальной игры (в release-сборке инертно):
   //   MISTMC_FAKE_GAME=1 npx electron .  → «игра» = пустой node-процесс на 10 мин
   if (!app.isPackaged && process.env.MISTMC_FAKE_GAME) {
@@ -1857,7 +1888,9 @@ ipcMain.handle('launch-game', async (_e, opts) => {
   // 32-битный процесс адресует ~2 ГБ на всё: больше ~1 ГБ кучи JVM не поднимет
   const ramCap = process.arch === 'ia32' ? 1024 : 32768;
   const ram = Math.max(process.arch === 'ia32' ? 512 : 1024, Math.min(ramCap, parseInt(opts.ram, 10) || 4096));
-  const joinServer = !!opts.joinServer;
+  const friendJoin = typeof opts.friendJoin === 'string' && NICK_RE.test(opts.friendJoin) ? opts.friendJoin : null;
+  // идём к другу — на сервер сами не подключаемся
+  const joinServer = !!opts.joinServer && !friendJoin;
   const gameDir = opts.gameDir || defaultGameDir();
   const mcVersion = mcOf({ mc: opts.mcVersion });
 
@@ -2084,6 +2117,8 @@ ipcMain.handle('launch-game', async (_e, opts) => {
           + ' МБ — вторая игра может зависнуть. Закрой лишние программы или уменьши память в настройках.');
       }
     }
+    // канал для просьб игры (моды друга); не открылся — играем без него
+    const ipcAddr = loader === 'fabric' ? await friendsync.issue(friendHandlers) : null;
     const proc = await launch({
       gamePath: gameDir,
       javaPath,
@@ -2104,9 +2139,13 @@ ipcMain.handle('launch-game', async (_e, opts) => {
         ...DEFAULT_EXTRA_JVM_ARGS.filter((v) => v !== '-Xmx2G'),
         ...(await mojangArgsPromise),
         ...secondGameArgs,
+        ...(friendJoin ? ['-Dmistsocial.autojoin=' + friendJoin] : []),
       ],
+      extraExecOption: ipcAddr ? { env: { ...process.env, MIST_LAUNCHER_IPC: ipcAddr } } : undefined,
     });
     gameProc = proc; // пока жив — закрытие окна не завершает лаунчер
+    lastLaunch = { opts, gameDir, loader, mcVersion };
+    friendRelaunch = null;
     markGameRunning(mcVersion);
 
     // Логи процесса (кратко) + хвост для разбора краша: если игра упала из-за
@@ -2185,6 +2224,20 @@ ipcMain.handle('launch-game', async (_e, opts) => {
       if (loadConfig().discordRpc !== false) {
         rpc.setIdle(account.name);
       }
+      // Игра закрылась сама, чтобы подхватить моды друга: запускаем её снова.
+      // Окно не разворачиваем, а фоновый лаунчер (окно закрыто) не выходит.
+      const again = friendRelaunch;
+      friendRelaunch = null;
+      if (again && Date.now() - again.at < FRIEND_RELAUNCH_TTL) {
+        logLine('▶ Перезапуск игры с новыми модами, вход в мир ' + again.join);
+        launchGame({ ...opts, friendJoin: again.join }).then((r) => {
+          if (r && r.ok) return;
+          send('launch-error', (r && r.error) || 'игра не перезапустилась');
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.restore();
+          else app.quit();
+        });
+        return;
+      }
       send('state', { state: 'idle' });
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.restore();
@@ -2204,4 +2257,4 @@ ipcMain.handle('launch-game', async (_e, opts) => {
     msg.split('\n').forEach((l) => logLine('   ' + l));
     return { ok: false, error: msg.split('\n')[0] };
   }
-});
+}

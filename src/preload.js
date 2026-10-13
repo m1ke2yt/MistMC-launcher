@@ -63,6 +63,7 @@ contextBridge.exposeInMainWorld('api', {
   onLaunchError: (cb) => ipcRenderer.on('launch-error', (_e, d) => cb(d)),
   onAuthExpired: (cb) => ipcRenderer.on('auth-expired', () => cb()),
   onJoinSupport: (cb) => ipcRenderer.on('join-support', (_e, d) => cb(d)),
+  onModsChanged: (cb) => ipcRenderer.on('mods-changed', () => cb()),
   onUpdateState: (cb) => ipcRenderer.on('update-state', (_e, d) => cb(d)),
   updateRestart: () => ipcRenderer.send('update-restart'),
 });
