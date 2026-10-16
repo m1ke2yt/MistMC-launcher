@@ -227,13 +227,21 @@ function typeInfo(type) {
 
 // ── кураторские подборки с русскими описаниями ─────────────────────────
 // Вшитые в сборку Mist MC (fabric-api, modmenu, cloth-config, ABP) не включаем.
-const CURATED = {
+// Актуальная подборка лежит на сайте (см. loadCurated) — её меняют без
+// пересборки лаунчера; этот список — запасной, если сайт не ответил.
+const BUILTIN_CURATED = {
   mod: [
     { slug: 'sodium', ru: 'Оптимизация рендера — заметно больше FPS' },
     { slug: 'lithium', ru: 'Оптимизация игровой логики — меньше лагов' },
     { slug: 'iris', ru: 'Шейдеры как в OptiFine — нужен для вкладки «Шейдеры»' },
     { slug: 'entityculling', ru: 'Не рисует мобов за стенами — ещё больше FPS' },
     { slug: 'ferrite-core', ru: 'Снижает расход оперативной памяти' },
+    { slug: 'renderscale', ru: 'Разрешение мира отдельно от интерфейса: ниже — больше FPS, выше — сглаживание' },
+    { slug: 'asyncparticles', ru: 'Частицы считаются отдельно — меньше просадок FPS от эффектов' },
+    { slug: 'hotbar-lag-fixer', ru: 'Убирает подлагивания хотбара с тяжёлыми предметами' },
+    { slug: 'async-pack-scan', ru: 'Экран ресурспаков открывается без зависаний' },
+    { slug: 'asynclogger', ru: 'Логи пишутся в фоне — меньше микрофризов' },
+    { slug: 'async', ru: 'Ускоряет мобов в одиночном мире; на сервере не действует' },
     // из голосовых рекомендуем ровно один — SVC (решение 31.07): две системы
     // в подборке путали игроков, ставили обе и не понимали, где их слышно
     { slug: 'simple-voice-chat', ru: 'Голосовой чат SVC — работает на Mist MC' },
@@ -272,9 +280,68 @@ const CURATED = {
     { slug: 'motschen-better-leaves', ru: 'Пышная объёмная листва' },
   ],
 };
-const CURATED_RU = new Map(
-  Object.values(CURATED).flat().map((c) => [c.slug, c.ru]),
-);
+function ruMap(curated) {
+  return new Map(Object.values(curated).flat().filter((c) => c.ru).map((c) => [c.slug, c.ru]));
+}
+let curatedLists = BUILTIN_CURATED;
+let curatedRu = ruMap(BUILTIN_CURATED);
+
+const CURATED_TYPES = ['mod', 'shader', 'resourcepack'];
+const CURATED_SLUG_RE = /^[a-z0-9_.-]{2,64}$/i;
+const CURATED_TTL_MS = 30 * 60_000;
+const CURATED_TIMEOUT_MS = 5000;
+let curatedFetchedAt = 0;
+let curatedLoading = null;
+let curatedSettled = false; // сайт хоть раз ответил или отказал
+
+/** Разбор ответа сайта; тип без годных записей берёт встроенный список. */
+function parseCurated(body) {
+  const src = body && body.ok && body.curated && typeof body.curated === 'object' ? body.curated : null;
+  if (!src) return null;
+  const out = {};
+  for (const t of CURATED_TYPES) {
+    const list = (Array.isArray(src[t]) ? src[t] : [])
+      .filter((c) => c && typeof c.slug === 'string' && CURATED_SLUG_RE.test(c.slug))
+      // запрещённое не рекомендуем, даже если оно попало в список на сайте
+      .filter((c) => !isBlocked(c.slug, c.slug))
+      .map((c) => ({ slug: c.slug, ru: typeof c.ru === 'string' ? c.ru.slice(0, 200) : '' }));
+    out[t] = list.length ? list : BUILTIN_CURATED[t];
+  }
+  return out;
+}
+
+/** Подтянуть подборку с сайта (раз в CURATED_TTL_MS); при любой ошибке остаётся прежняя. */
+async function loadCurated() {
+  if (Date.now() - curatedFetchedAt < CURATED_TTL_MS) return;
+  if (!curatedLoading) {
+    curatedLoading = (async () => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), CURATED_TIMEOUT_MS);
+      try {
+        const res = await site.siteFetch(buildSecret.NET.api.curated, {
+          headers: { 'User-Agent': USER_AGENT },
+          signal: ac.signal,
+        });
+        const next = res.ok ? parseCurated(await res.json()) : null;
+        if (next) {
+          curatedLists = next;
+          curatedRu = ruMap(next);
+          curatedCache.clear();
+          curatedFetchedAt = Date.now();
+        } else {
+          curatedFetchedAt = Date.now() - CURATED_TTL_MS + 60_000; // повтор через минуту
+        }
+      } catch (_) {
+        curatedFetchedAt = Date.now() - CURATED_TTL_MS + 60_000;
+      } finally {
+        clearTimeout(timer);
+        curatedLoading = null;
+        curatedSettled = true;
+      }
+    })();
+  }
+  await curatedLoading;
+}
 
 async function apiGet(url) {
   // до 3 раундов (каждый раунд = прямой + прокси): Modrinth периодически
@@ -405,7 +472,7 @@ function hitToItem(h) {
     projectId: h.project_id,
     slug: h.slug,
     title: h.title,
-    description: CURATED_RU.get(h.slug) || h.description || '',
+    description: curatedRu.get(h.slug) || h.description || '',
     iconUrl: h.icon_url || '',
     downloads: h.downloads || 0,
   };
@@ -430,7 +497,13 @@ async function searchContent(query, type, loader, mcVersion) {
 // ── популярные (кураторские подборки) ───────────────────────────────────
 const curatedCache = new Map(); // type -> ответ /projects
 async function popularContent(type, loader, mcVersion) {
-  const listDef = CURATED[type] || [];
+  // ждём сайт только в первый раз (и не дольше таймаута) — дальше подборка
+  // обновляется в фоне, а вкладка открывается с тем, что уже есть
+  const loading = loadCurated();
+  if (!curatedSettled) {
+    await Promise.race([loading, new Promise((r) => setTimeout(r, CURATED_TIMEOUT_MS).unref())]);
+  }
+  const listDef = curatedLists[type] || [];
   if (!listDef.length) return [];
   if (!curatedCache.has(type)) {
     const ids = encodeURIComponent(JSON.stringify(listDef.map((c) => c.slug)));
@@ -448,7 +521,7 @@ async function popularContent(type, loader, mcVersion) {
       projectId: p.id,
       slug: p.slug,
       title: p.title,
-      description: c.ru,
+      description: c.ru || p.description || '',
       iconUrl: p.icon_url || '',
       downloads: p.downloads || 0,
     });
@@ -472,7 +545,7 @@ async function projectDetails(idOrSlug) {
     projectId: p.id,
     slug: p.slug,
     title: p.title || p.slug,
-    description: CURATED_RU.get(p.slug) || p.description || '',
+    description: curatedRu.get(p.slug) || p.description || '',
     body: p.body || '',
     iconUrl: p.icon_url || '',
     downloads: p.downloads || 0,

@@ -26,6 +26,7 @@ module.exports = {
       cape: '',
       skin: '',
       cosmeticPack: '',
+      curated: '',
     },
   },
 };
