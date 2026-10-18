@@ -714,7 +714,10 @@ function installedRow(mod, bundled, foreign, issues) {
   s.textContent = otherLoader
     ? 'мод для ' + (mod.loader === 'fabric' ? 'Fabric' : 'Forge') + ' — заработает при смене сборки, файл на месте'
     : foreign ? 'мод для Minecraft ' + mod.forMc + ' — заработает при возврате на эту версию, файл на месте'
-      : bundled ? 'Сборка Mist MC' : (mod.versionNumber ? 'v' + mod.versionNumber : 'установлен из Modrinth');
+      : bundled ? (mod.optional
+        ? (mod.enabled ? 'Сборка Mist MC · необязательный, включён' : 'Сборка Mist MC · необязательный — включите, если нужен')
+        : 'Сборка Mist MC')
+        : (mod.versionNumber ? 'v' + mod.versionNumber : 'установлен из Modrinth');
   // что с модом не так на выбранной версии игры (см. mods.diagnose)
   if (!foreign && issues && issues.length) {
     const hard = issues.some((i) => i.level !== 'info');

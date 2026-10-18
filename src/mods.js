@@ -6,7 +6,7 @@
 // ресурспаки → resourcepacks, шейдеры → shaderpacks (работают через Iris).
 // Выключенный файл = <file>.disabled. Реестр — <gameDir>/launcher-mods.json:
 //   { user: [{projectId, slug, title, iconUrl, fileName, type, loader, enabled}],
-//     bundledDisabled: ["file.jar"] }
+//     bundledDisabled: ["file.jar"], bundledOptIn: ["MistWave-"] }
 
 const fs = require('fs');
 const path = require('path');
@@ -30,6 +30,27 @@ const BUNDLED_PROJECTS = new Set(['P7dR8mSH', 'mOgUt4GM', '9s6osm5g']);
 const BUNDLED_MC = '1.21.11';
 /** Вшиты ли на этой версии библиотеки сборки (fabric-api, modmenu, cloth-config). */
 function bundledApplies(loader, mc) { return loader === 'fabric' && mc === BUNDLED_MC; }
+
+// Вшитые, но необязательные моды: лежат в сборке, а включает их сам игрок во
+// вкладке «Моды» (по умолчанию выключены). Ключ — начало имени файла: по нему
+// помним выбор, и он переживает смену версии игры и обновление мода.
+// MistWave — Яндекс Музыка в игре.
+const BUNDLED_OPT_IN = ['MistWave-'];
+function optInKey(fileName) {
+  const f = path.basename(String(fileName));
+  return BUNDLED_OPT_IN.find((k) => f.startsWith(k)) || null;
+}
+/** Включён ли вшитый джарник у этого игрока. */
+function bundledOn(m, fileName) {
+  const key = optInKey(fileName);
+  return key ? m.bundledOptIn.includes(key) : !m.bundledDisabled.includes(fileName);
+}
+/** Вшитые джарники, которые сейчас выключены: выключенные игроком и невключённые необязательные. */
+function bundledOff(m, jars) {
+  const out = m.bundledDisabled.slice();
+  for (const f of jars || []) if (optInKey(f) && !bundledOn(m, f) && !out.includes(f)) out.push(f);
+  return out;
+}
 
 // Версия загрузчика, под которую ставим моды. main.js сообщает её после выбора
 // стабильного Fabric Loader (мета Fabric, см. resolveFabricLoader). Нужна, чтобы
@@ -372,9 +393,10 @@ function readManifest(gameDir) {
     return {
       user,
       bundledDisabled: Array.isArray(raw.bundledDisabled) ? raw.bundledDisabled : [],
+      bundledOptIn: Array.isArray(raw.bundledOptIn) ? raw.bundledOptIn : [],
     };
   } catch (_) {
-    return { user: [], bundledDisabled: [] };
+    return { user: [], bundledDisabled: [], bundledOptIn: [] };
   }
 }
 function writeManifest(gameDir, m) {
@@ -445,7 +467,8 @@ function listContent(gameDir, type, loader, bundledDir, mc = BUNDLED_MC) {
     ? bundledFor(bundledDir, loader, mc).jars.map((f) => ({
         fileName: f,
         title: f.replace(/\.jar$/i, ''),
-        enabled: !m.bundledDisabled.includes(f),
+        enabled: bundledOn(m, f),
+        optional: !!optInKey(f),
       }))
     : [];
   // подчистка: записи, чьи файлы удалили руками (или доудалило отложенное)
@@ -864,8 +887,14 @@ function toggleUserContent(gameDir, type, fileName, enabled) {
 
 function toggleBundledMod(gameDir, fileName, enabled) {
   const m = readManifest(gameDir);
-  m.bundledDisabled = m.bundledDisabled.filter((f) => f !== fileName);
-  if (!enabled) m.bundledDisabled.push(fileName);
+  const key = optInKey(fileName);
+  if (key) {
+    m.bundledOptIn = m.bundledOptIn.filter((k) => k !== key);
+    if (enabled) m.bundledOptIn.push(key);
+  } else {
+    m.bundledDisabled = m.bundledDisabled.filter((f) => f !== fileName);
+    if (!enabled) m.bundledDisabled.push(fileName);
+  }
   const p = path.join(contentDir(gameDir, 'mod'), fileName);
   try {
     if (!enabled && fs.existsSync(p)) fs.unlinkSync(p);
@@ -1542,7 +1571,7 @@ const KNOWN_MOD_PROJECTS = {
 async function installMissingDep(gameDir, loader, mcVersion, log, by, depId) {
   const mine = bundledFor(bundledDirSeen, loader, mcVersion);
   if (mine.dir) {
-    for (const f of readManifest(gameDir).bundledDisabled) {
+    for (const f of bundledOff(readManifest(gameDir), mine.jars)) {
       const src = path.join(mine.dir, f);
       const info = mine.jars.includes(f) && fs.existsSync(src) ? fabricModInfo(src) : null;
       if (!info || !providesId(info, depId)) continue;
@@ -1833,7 +1862,7 @@ function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC) {
   for (const [f, dir] of everyBundled) {
     const dest = path.join(contentDir(gameDir, 'mod'), f);
     const applies = bundled.includes(f);
-    const wanted = applies && !m.bundledDisabled.includes(f);
+    const wanted = applies && bundledOn(m, f);
     try {
       if (wanted) {
         fs.copyFileSync(path.join(dir, f), dest);
@@ -2347,7 +2376,7 @@ async function findByModId(want, loader, mc) {
 function disabledBundled(gameDir, loader, mc, modId) {
   const mine = bundledFor(bundledDirSeen, loader, mc);
   if (!mine.dir) return null;
-  for (const f of readManifest(gameDir).bundledDisabled) {
+  for (const f of bundledOff(readManifest(gameDir), mine.jars)) {
     const info = mine.jars.includes(f) ? fabricModInfo(path.join(mine.dir, f)) : null;
     if (info && providesId(info, modId)) return f;
   }
