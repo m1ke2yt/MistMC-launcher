@@ -262,10 +262,20 @@ const state = {
   ratings: new Map(), // projectId → { likes, dislikes, mine }
   theme: {},          // цвета и фон из настроек
   bgMedia: null,      // фон окна: { url, kind: 'image' | 'video' }
+  profiles: { active: 'mistmc', list: [], icons: [], loaders: [] }, // сборки (как инстансы Prism)
 };
 
+const LOADER_NAMES = { fabric: 'Fabric', forge: 'Forge', neoforge: 'NeoForge', quilt: 'Quilt', vanilla: 'Vanilla' };
+function loaderName(l) { return LOADER_NAMES[l] || l || ''; }
+/** Выбранная сборка (запись из списка) и главная ли она. */
+function curProfile() {
+  const pr = state.profiles;
+  return (pr.list || []).find((x) => x.id === pr.active) || { id: 'mistmc', main: true, name: 'Mist MC' };
+}
+function isMain() { return curProfile().main !== false; }
+
 const CTYPE_HINTS = {
-  mod: () => 'Каталог Modrinth для Minecraft ' + state.mc + ' · моды под ' + (state.loader === 'fabric' ? 'Fabric' : 'Forge'),
+  mod: () => 'Сборка «' + curProfile().name + '» · Minecraft ' + state.mc + ' · каталог Modrinth под ' + loaderName(state.loader),
   resourcepack: () => 'Ресурспаки — включаются в игре: Настройки → Наборы ресурсов',
   shader: () => 'Шейдеры работают через мод Iris (поставь его во вкладке «Моды»); включаются в игре: Настройки → Шейдеры',
 };
@@ -274,6 +284,14 @@ const LOADER_HINTS = {
   fabric: 'Fabric — рекомендуется, с модами Mist MC',
   forge: 'Forge — для модпаков на Forge',
   vanilla: 'Vanilla — чистый клиент без модов',
+};
+// подсказки в своей сборке: модов Mist там по умолчанию нет
+const LOADER_HINTS_OWN = {
+  fabric: 'Fabric — большинство модов Modrinth',
+  forge: 'Forge — классические модпаки',
+  neoforge: 'NeoForge — новые модпаки на Forge-модах',
+  quilt: 'Quilt — грузит и моды Fabric',
+  vanilla: 'Vanilla — чистый Minecraft без модов',
 };
 const NICK_RE = /^[A-Za-z0-9_]{3,16}$/;
 
@@ -504,6 +522,7 @@ function setBusy(busy) {
   state.busy = busy;
   els.btnPlay.disabled = busy || !state.account;
   els.mcSelect.disabled = busy; // версию меняют между запусками
+  document.body.classList.toggle('game-busy', busy);
 }
 
 // Версия игры
@@ -514,7 +533,7 @@ function renderMcSelect() {
   for (const v of state.gameVersions) {
     const o = document.createElement('option');
     o.value = v.id;
-    o.textContent = v.id + (v.latest && !v.server ? ' · новейшая' : '')
+    o.textContent = v.id + (v.server ? ' · сервер Mist MC' : v.latest ? ' · новейшая' : '')
       + (v.supported ? '' : ' · только 64-бит');
     o.disabled = !v.supported;
     if (!v.supported) o.title = v.reason;
@@ -523,13 +542,27 @@ function renderMcSelect() {
   els.mcSelect.value = state.mc;
 }
 
+/** Кнопки загрузчика: в главной сборке — Fabric/Forge/Vanilla, в своей — все. */
+function renderLoaderSeg() {
+  const list = isMain() ? ['fabric', 'forge', 'vanilla'] : (state.profiles.loaders || ['fabric', 'forge', 'neoforge', 'quilt', 'vanilla']);
+  els.loader.replaceChildren(...list.map((l) => {
+    const b = document.createElement('button');
+    b.className = 'seg' + (l === state.loader ? ' active' : '');
+    b.dataset.val = l;
+    b.textContent = loaderName(l);
+    return b;
+  }));
+  els.loader.classList.toggle('seg-many', list.length > 3);
+}
+
 function updateLoaderHint() {
-  const noForge = state.loader === 'forge' && !state.versionInfo.forge;
+  const noForge = state.loader === 'forge' && !state.versionInfo.forge && isMain();
   els.loaderHint.textContent = noForge
     ? 'Forge под ' + state.mc + ' ещё не вышел — выбери Fabric'
-    : state.loader === 'fabric' && state.mc !== serverMc()
-      ? 'Fabric — моды из каталога под ' + state.mc
-      : LOADER_HINTS[state.loader];
+    : !isMain() ? LOADER_HINTS_OWN[state.loader] || ''
+      : state.loader === 'fabric' && state.mc !== serverMc()
+        ? 'Fabric — моды из каталога под ' + state.mc
+        : LOADER_HINTS[state.loader];
   els.loaderHint.classList.toggle('hint-error', noForge);
 }
 
@@ -537,13 +570,35 @@ function updateLoaderHint() {
 function updateVersionUI() {
   const info = state.versionInfo;
   const onServer = state.mc === serverMc();
+  const prof = curProfile();
   els.mcVer.textContent = state.mc;
   els.verLine.textContent = (info.launcher ? 'v' + info.launcher + ' · ' : '')
-    + 'Fabric ' + (info.fabric || '?') + ' / Forge ' + (info.forge || '—');
-  els.mcHint.textContent = onServer ? 'Полная сборка модов Mist MC' : 'Сервер Mist MC работает на ' + serverMc();
+    + (!prof.main && prof.loaderVersion && prof.loader === state.loader
+      ? loaderName(state.loader) + ' ' + prof.loaderVersion
+      : 'Fabric ' + (info.fabric || '?') + ' / Forge ' + (info.forge || '—'));
+  renderProfileHead();
+  els.mcHint.textContent = !prof.main
+    ? (onServer ? 'Как на сервере Mist MC' : 'Сервер Mist MC работает на ' + serverMc())
+    : onServer ? 'Полная сборка модов Mist MC' : 'Сервер Mist MC работает на ' + serverMc();
   updateLoaderHint();
-  if (onServer) { els.mcNote.hidden = true; return; }
   const v = state.gameVersions.find((x) => x.id === state.mc) || {};
+  // своя сборка: только то, что важно для неё (Java, вход на сервер)
+  if (!prof.main) {
+    const parts = [];
+    const join = state.joinKnown[state.mc];
+    if (els.joinServer.checked && !onServer) {
+      parts.push(join === false
+        ? 'Сервер Mist MC эту версию пока не принимает — игра запустится без автовхода.'
+        : 'Пустит ли сервер Mist MC с ' + state.mc + ', лаунчер проверит при запуске.');
+    }
+    // вшитая Java 21 запускает и версии с Java 17; качается только 8, 16 и 25
+    if (v.java && (v.java > 21 || v.java < 17)) parts.push('При первом запуске скачается Java ' + v.java + '.');
+    els.mcNote.textContent = parts.join(' ');
+    els.mcNote.classList.toggle('warn', join === false && els.joinServer.checked);
+    els.mcNote.hidden = !parts.length;
+    return;
+  }
+  if (onServer) { els.mcNote.hidden = true; return; }
   const join = state.joinKnown[state.mc];
   const parts = [info.mistMods
     ? 'Плащи и друзья Mist MC на ' + state.mc + ' работают; остальные моды сборки есть только на ' + serverMc() + '.'
@@ -559,7 +614,7 @@ function updateVersionUI() {
 }
 
 function persist() {
-  window.api.saveConfig({
+  return window.api.saveConfig({
     ram: parseInt(els.ram.value, 10),
     loader: state.loader,
     joinServer: els.joinServer.checked,
@@ -712,12 +767,13 @@ function installedRow(mod, bundled, foreign, issues) {
   // чужой загрузчик или чужая версия игры: файл на месте, просто сейчас не грузится
   const otherLoader = foreign && mod.loader && mod.loader !== state.loader;
   s.textContent = otherLoader
-    ? 'мод для ' + (mod.loader === 'fabric' ? 'Fabric' : 'Forge') + ' — заработает при смене сборки, файл на месте'
+    ? 'мод для ' + loaderName(mod.loader) + ' — заработает при смене загрузчика, файл на месте'
     : foreign ? 'мод для Minecraft ' + mod.forMc + ' — заработает при возврате на эту версию, файл на месте'
       : bundled ? (mod.optional
         ? (mod.enabled ? 'Сборка Mist MC · необязательный, включён' : 'Сборка Mist MC · необязательный, выключен')
         : 'Сборка Mist MC')
-        : (mod.versionNumber ? 'v' + mod.versionNumber : 'установлен из Modrinth');
+        : mod.manual ? 'добавлен вручную' + (mod.versionNumber ? ' · v' + mod.versionNumber : '')
+          : (mod.versionNumber ? 'v' + mod.versionNumber : 'установлен из Modrinth');
   // что с модом не так на выбранной версии игры (см. mods.diagnose)
   if (!foreign && issues && issues.length) {
     const hard = issues.some((i) => i.level !== 'info');
@@ -744,7 +800,7 @@ function installedRow(mod, bundled, foreign, issues) {
   if (foreign) {
     const badge = document.createElement('span');
     badge.className = 'mod-dl';
-    badge.textContent = otherLoader ? (mod.loader === 'fabric' ? 'Fabric' : 'Forge') : mod.forMc;
+    badge.textContent = otherLoader ? loaderName(mod.loader) : mod.forMc;
     controls.appendChild(badge);
     const del = document.createElement('button');
     del.className = 'mod-del';
@@ -2699,7 +2755,8 @@ const THEME_DEFAULT = { accent: '#a855f7', bg: '#0f0518', bgOpacity: 45, bgScale
 // или {o:100,x:0,y:0} = как нарисовано.
 const UI_BLOCKS = {
   tabs:       { sel: '#tabs',                        name: 'Вкладки' },
-  hero:       { sel: '#view-game .hero',             name: 'Заголовок' },
+  hero:       { sel: '#view-game .inst-head',        name: 'Заголовок сборки' },
+  side:       { sel: '#view-game .inst-side',        name: 'Список сборок' },
   play:       { sel: '#view-game .card',             name: 'Панель запуска' },
   log:        { sel: '#logbox',                      name: 'Журнал' },
   mods_head:  { sel: '#view-mods .mods-head',        name: 'Панель поиска' },
@@ -3259,9 +3316,557 @@ window.addEventListener('resize', () => {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeOverlay(overlay); });
 })();
 
+// ── сборки (как инстансы в Prism) ───────────────────────────────────────
+// Значки 8×8 в духе Minecraft: строка = ряд пикселей, буква = цвет из палитры.
+const PIXEL_ICONS = {
+  grass: { p: { G: '#5fa83a', g: '#4c8f2c', d: '#866043', D: '#6b4a32' },
+    m: ['GGgGGGgG', 'gGGGgGGG', 'GdGGdGgd', 'dDdddDdd', 'ddDdddDd', 'dddDdddd', 'dDddDddD', 'ddddddDd'] },
+  diamond: { p: { c: '#4fe0d6', C: '#1fa39b', W: '#d9fffb' },
+    m: ['..cccc..', '.cWWccc.', 'cWccccCc', 'ccccccCc', '.ccccCC.', '..cccC..', '...cC...', '........'] },
+  pickaxe: { p: { C: '#cfd6dc', K: '#8d98a3', w: '#8a5a2b' },
+    m: ['.KCCCK..', 'K.....C.', '.....wKC', '....w..C', '...w...K', '..w.....', '.w......', 'w.......'] },
+  sword: { p: { C: '#e3e8ec', K: '#9aa4ad', w: '#8a5a2b', y: '#d9a441' },
+    m: ['......CC', '.....CKC', '....CKC.', '.y.CKC..', '..yKC...', '..wy....', '.w..y...', 'w.......'] },
+  creeper: { p: { g: '#5cb85c', G: '#3e8e3e', k: '#14240f' },
+    m: ['gGgggGgg', 'gkkggkkg', 'gkkGgkkg', 'ggGkkggg', 'gGkkkkGg', 'ggkkkkgg', 'gGkggkgg', 'ggGgggGg'] },
+  enderpearl: { p: { t: '#1f8a7a', T: '#2fbfa7', k: '#0b3b35', L: '#9ff5e6' },
+    m: ['..tttt..', '.tTTTTt.', 'tTLTTkTt', 'tTTkkkTt', 'tTkkkTTt', 'tTTkTTTt', '.tTTTTt.', '..tttt..'] },
+  book: { p: { b: '#7a4a24', B: '#5a3418', p: '#efe6cf', r: '#b03a2e' },
+    m: ['.bbbbbb.', 'bBpppppb', 'bBprrrpb', 'bBpppppb', 'bBprrppb', 'bBpppppb', 'bBBBBBBb', '.bbbbbb.'] },
+  flame: { p: { y: '#ffd84a', o: '#ff8a1f', r: '#e0401a' },
+    m: ['...o....', '..oo..o.', '..oyo.oo', '.oyyoooo', '.oyyyyoo', 'royyyyor', 'rooyyoor', '.rroorr.'] },
+  chest: { p: { b: '#a0662e', B: '#6e4419', k: '#2a1a0a', g: '#e2cd84' },
+    m: ['BBBBBBBB', 'BbbbbbbB', 'BbbbbbbB', 'kkkggkkk', 'BbbggbbB', 'BbbbbbbB', 'BbbbbbbB', 'BBBBBBBB'] },
+  star: { p: { y: '#ffe066', Y: '#ffc107', w: '#fffbe0' },
+    m: ['...yy...', '...yy...', 'yyywwyyy', '.yywwyy.', '..yyyy..', '.yyYYyy.', '.yY..Yy.', 'yY....Yy'] },
+};
+
+function pixelSvg(key) {
+  const def = PIXEL_ICONS[key] || PIXEL_ICONS.grass;
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 8 8');
+  def.m.forEach((row, y) => {
+    [...row].forEach((ch, x) => {
+      const fill = def.p[ch];
+      if (!fill) return;
+      const r = document.createElementNS(ns, 'rect');
+      r.setAttribute('x', x); r.setAttribute('y', y);
+      r.setAttribute('width', 1.02); r.setAttribute('height', 1.02);
+      r.setAttribute('fill', fill);
+      svg.appendChild(r);
+    });
+  });
+  return svg;
+}
+
+/** Значок сборки: у главной — логотип Mist, у перенесённой — картинка из Prism. */
+function profileIcon(p, big) {
+  const el = document.createElement('div');
+  el.className = 'inst-icon' + (big ? ' inst-icon-big' : '');
+  if (p.main) {
+    el.classList.add('mist');
+    el.textContent = '✦';
+  } else if (p.iconUrl) {
+    const img = document.createElement('img');
+    img.src = p.iconUrl;
+    img.alt = '';
+    img.addEventListener('error', () => { img.remove(); el.appendChild(pixelSvg(p.icon)); });
+    el.appendChild(img);
+  } else {
+    el.appendChild(pixelSvg(p.icon));
+  }
+  return el;
+}
+
+function fmtPlayTime(ms) {
+  const min = Math.round((ms || 0) / 60000);
+  if (min < 1) return '';
+  if (min < 60) return min + ' мин';
+  const h = Math.floor(min / 60);
+  return h < 100 ? h + ' ч ' + (min % 60 ? (min % 60) + ' мин' : '').trim() : h + ' ч';
+}
+function modsWord(n) {
+  const a = n % 10;
+  const b = n % 100;
+  if (a === 1 && b !== 11) return n + ' мод';
+  if (a >= 2 && a <= 4 && (b < 12 || b > 14)) return n + ' мода';
+  return n + ' модов';
+}
+
+function renderProfiles() {
+  const box = $('inst-list');
+  if (!box) return;
+  const list = state.profiles.list || [];
+  box.replaceChildren();
+  // как в Prism: сначала без группы, затем по группам
+  const groups = new Map([['', []]]);
+  for (const p of list) {
+    const g = p.main ? '' : (p.group || '');
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(p);
+  }
+  for (const [g, items] of groups) {
+    if (!items.length) continue;
+    if (g) {
+      const h = document.createElement('div');
+      h.className = 'inst-group';
+      h.textContent = g;
+      box.appendChild(h);
+    }
+    for (const p of items) {
+      const b = document.createElement('button');
+      b.className = 'inst-item' + (p.id === state.profiles.active ? ' active' : '') + (p.missing ? ' missing' : '');
+      b.title = p.main ? 'Сборка сервера Mist MC' : p.name + (p.missing ? ' — папка сборки не найдена' : '');
+      const text = document.createElement('div');
+      text.className = 'inst-item-text';
+      const n = document.createElement('div');
+      n.className = 'inst-item-name';
+      n.textContent = p.name;
+      const sub = document.createElement('div');
+      sub.className = 'inst-item-sub';
+      sub.textContent = p.mcVersion + ' · ' + loaderName(p.loader) + (p.main ? ' · сервер' : '');
+      text.append(n, sub);
+      b.append(profileIcon(p), text);
+      if (p.running) {
+        const dot = document.createElement('span');
+        dot.className = 'live-dot';
+        dot.title = 'Игра запущена';
+        b.appendChild(dot);
+      }
+      b.addEventListener('click', () => selectProfile(p.id));
+      b.addEventListener('dblclick', () => { if (p.id === state.profiles.active && !state.busy) els.btnPlay.click(); });
+      b.addEventListener('contextmenu', (e) => { e.preventDefault(); openProfileCtx(p, e.clientX, e.clientY); });
+      box.appendChild(b);
+    }
+  }
+}
+
+/** Шапка справа: значок, название, что внутри и сколько наиграно. */
+function renderProfileHead() {
+  const p = curProfile();
+  const icon = $('inst-icon');
+  if (!icon) return;
+  icon.replaceWith(Object.assign(profileIcon(p, true), { id: 'inst-icon' }));
+  $('inst-title').textContent = p.name;
+  const bits = [loaderName(state.loader)];
+  if (state.loader !== 'vanilla' && typeof p.mods === 'number') bits.push(modsWord(p.mods));
+  const played = fmtPlayTime(p.playTime);
+  if (played) bits.push('сыграно ' + played);
+  $('inst-sub-rest').textContent = ' · ' + bits.join(' · ');
+  $('quick-mods').textContent = state.loader !== 'vanilla' && p.mods ? String(p.mods) : '';
+  $('btn-inst-edit').hidden = !!p.main;
+}
+
+async function refreshProfiles() {
+  try {
+    state.profiles = await window.api.profilesList();
+    renderProfiles();
+    renderProfileHead();
+  } catch (_) { /* список обновится при следующем действии */ }
+}
+
+async function selectProfile(id, opts = {}) {
+  if (id === state.profiles.active && !opts.force) return;
+  if (state.busy) { flashStatus('Сборку меняют между запусками — сначала закрой игру'); return; }
+  const res = await window.api.profileSelect(id);
+  if (!res || !res.ok) { flashStatus((res && res.error) || 'Не удалось выбрать сборку'); return; }
+  applyConfig(await window.api.getConfig());
+  // у каждой сборки свой набор модов и каталог
+  state.lastHits = [];
+  state.modsReport = null;
+  els.secResults.hidden = true;
+  if (state.tab === 'mods') refreshModsView();
+  refreshGameVersions();
+  els.status.textContent = 'Сборка: ' + curProfile().name;
+}
+
+// «Папка ▾» и быстрые кнопки
+(() => {
+  const btn = $('btn-inst-folder');
+  const menu = $('folder-menu');
+  btn.addEventListener('click', (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; });
+  document.addEventListener('click', (e) => { if (!menu.hidden && !menu.contains(e.target)) menu.hidden = true; });
+  menu.addEventListener('click', async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    menu.hidden = true;
+    const res = await window.api.openGameDir(b.dataset.sub || undefined);
+    if (res && !res.ok) els.status.textContent = 'Не удалось открыть папку: ' + (res.error || '?');
+  });
+  $('inst-quick').addEventListener('click', async (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.go) {
+      setTab('mods');
+      if (state.contentType !== b.dataset.go) setContentType(b.dataset.go);
+    } else if (b.dataset.open) {
+      const res = await window.api.openGameDir(b.dataset.open);
+      if (res && !res.ok) els.status.textContent = 'Не удалось открыть папку: ' + (res.error || '?');
+    }
+  });
+  $('btn-inst-new').addEventListener('click', () => openProfileModal(null));
+  $('btn-inst-edit').addEventListener('click', () => { if (!isMain()) openProfileModal(curProfile()); });
+})();
+
+// меню по правому клику на сборке
+const ctxMenu = $('inst-ctx');
+let ctxProfile = null;
+function openProfileCtx(p, x, y) {
+  ctxProfile = p;
+  for (const b of ctxMenu.querySelectorAll('button')) {
+    const own = ['edit', 'dup', 'del'].includes(b.dataset.act);
+    b.hidden = own && p.main;
+    b.disabled = state.busy && ['play', 'del'].includes(b.dataset.act);
+  }
+  ctxMenu.hidden = false;
+  const w = ctxMenu.offsetWidth;
+  const h = ctxMenu.offsetHeight;
+  ctxMenu.style.left = Math.min(x, window.innerWidth - w - 8) + 'px';
+  ctxMenu.style.top = Math.min(y, window.innerHeight - h - 8) + 'px';
+}
+document.addEventListener('click', (e) => { if (!ctxMenu.hidden && !ctxMenu.contains(e.target)) ctxMenu.hidden = true; });
+ctxMenu.addEventListener('click', async (e) => {
+  const b = e.target.closest('button');
+  if (!b || !ctxProfile) return;
+  ctxMenu.hidden = true;
+  const p = ctxProfile;
+  const act = b.dataset.act;
+  if (act === 'play') {
+    if (p.id !== state.profiles.active) await selectProfile(p.id);
+    if (p.id === state.profiles.active && !state.busy) els.btnPlay.click();
+  } else if (act === 'edit') {
+    openProfileModal(p);
+  } else if (act === 'folder') {
+    if (p.id !== state.profiles.active) await selectProfile(p.id);
+    window.api.openGameDir();
+  } else if (act === 'dup') {
+    duplicateProfile(p);
+  } else if (act === 'del') {
+    openProfileModal(p, { confirmDelete: true });
+  }
+});
+
+async function duplicateProfile(p) {
+  flashStatus('Копирую «' + p.name + '»…');
+  const res = await window.api.profileDuplicate(p.id);
+  if (!res || !res.ok) { flashStatus((res && res.error) || 'Не удалось скопировать'); return; }
+  await refreshProfiles();
+  await selectProfile(res.id);
+}
+
+// ── модалка «Новая сборка» / «Настройки сборки» ──
+const instModal = {
+  overlay: $('inst-overlay'),
+  editing: null, // null — новая
+  icon: 'grass',
+  loader: 'fabric',
+};
+function renderInstIcons() {
+  const grid = $('inst-icons');
+  grid.replaceChildren(...(state.profiles.icons || Object.keys(PIXEL_ICONS)).map((key) => {
+    const el = profileIcon({ icon: key });
+    el.classList.toggle('sel', key === instModal.icon);
+    el.title = key;
+    el.addEventListener('click', () => { instModal.icon = key; renderInstIcons(); });
+    return el;
+  }));
+}
+function renderInstLoaders() {
+  const seg = $('inst-loader');
+  seg.replaceChildren(...(state.profiles.loaders || []).map((l) => {
+    const b = document.createElement('button');
+    b.className = 'seg' + (l === instModal.loader ? ' active' : '');
+    b.textContent = loaderName(l);
+    b.addEventListener('click', () => { instModal.loader = l; renderInstLoaders(); });
+    return b;
+  }));
+  $('inst-loader-hint').textContent = LOADER_HINTS_OWN[instModal.loader] || '';
+}
+async function fillInstVersions() {
+  const sel = $('inst-mc');
+  // для своих сборок — все релизы; берём список из get-config своей сборки,
+  // а пока окно на главной — дозапрашиваем
+  let list = !isMain() ? state.gameVersions : null;
+  if (!list || list.length < 10) {
+    sel.replaceChildren(new Option('Загружаю список версий…', ''));
+    try {
+      const all = await window.api.allVersions();
+      list = all && all.length ? all : state.gameVersions;
+    } catch (_) { list = state.gameVersions; }
+  }
+  sel.replaceChildren(...list.map((v) => {
+    const o = new Option(v.id + (v.server ? ' · сервер Mist MC' : v.latest ? ' · новейшая' : '') + (v.supported ? '' : ' · только 64-бит'), v.id);
+    o.disabled = !v.supported;
+    return o;
+  }));
+  sel.value = serverMc();
+}
+function openProfileModal(p, opts = {}) {
+  instModal.editing = p;
+  instModal.icon = p ? p.icon : (state.profiles.icons || ['grass'])[((state.profiles.list || []).length) % 10] || 'grass';
+  instModal.loader = 'fabric';
+  $('inst-modal-title').textContent = p ? 'Настройки сборки' : 'Новая сборка';
+  $('inst-name').value = p ? p.name : '';
+  $('inst-create-only').hidden = !!p;
+  $('inst-edit-only').hidden = !p;
+  $('inst-save').textContent = p ? 'Сохранить' : 'Создать сборку';
+  $('inst-error').hidden = true;
+  $('inst-del-confirm').hidden = !opts.confirmDelete;
+  if (p) {
+    $('inst-mist').checked = p.mistMods !== false;
+    // моды Mist — только Fabric
+    $('inst-mist-row').hidden = p.loader !== 'fabric';
+  } else {
+    renderInstLoaders();
+    fillInstVersions();
+  }
+  renderInstIcons();
+  openOverlay(instModal.overlay);
+  if (!p) setTimeout(() => $('inst-name').focus(), 30);
+}
+function instError(t) { const e = $('inst-error'); e.textContent = t; e.hidden = false; }
+$('inst-modal-close').addEventListener('click', () => closeOverlay(instModal.overlay));
+instModal.overlay.addEventListener('click', (e) => { if (e.target === instModal.overlay) closeOverlay(instModal.overlay); });
+$('inst-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('inst-save').click(); });
+$('inst-save').addEventListener('click', async () => {
+  const name = $('inst-name').value.trim();
+  if (!name) { instError('Придумай название сборки'); return; }
+  const btn = $('inst-save');
+  btn.disabled = true;
+  const p = instModal.editing;
+  let res;
+  if (p) {
+    const patch = { name, icon: instModal.icon };
+    if (p.loader === 'fabric') patch.mistMods = $('inst-mist').checked;
+    res = await window.api.profileUpdate(p.id, patch);
+  } else {
+    const mc = $('inst-mc').value;
+    if (!mc) { btn.disabled = false; instError('Выбери версию Minecraft'); return; }
+    res = await window.api.profileCreate({ name, icon: instModal.icon, mcVersion: mc, loader: instModal.loader });
+  }
+  btn.disabled = false;
+  if (!res || !res.ok) { instError((res && res.error) || 'Не получилось'); return; }
+  closeOverlay(instModal.overlay);
+  await refreshProfiles();
+  if (!p) await selectProfile(res.id);
+  else if (p.id === state.profiles.active) { renderProfileHead(); if (state.tab === 'mods') refreshModsView(); }
+});
+$('inst-dup').addEventListener('click', () => { const p = instModal.editing; closeOverlay(instModal.overlay); if (p) duplicateProfile(p); });
+$('inst-del').addEventListener('click', () => { $('inst-del-confirm').hidden = false; });
+$('inst-del-no').addEventListener('click', () => { $('inst-del-confirm').hidden = true; });
+$('inst-del-yes').addEventListener('click', async () => {
+  const p = instModal.editing;
+  if (!p) return;
+  const res = await window.api.profileDelete(p.id, $('inst-del-files').checked);
+  if (!res || !res.ok) { instError((res && res.error) || 'Не удалось удалить'); return; }
+  closeOverlay(instModal.overlay);
+  const wasActive = p.id === state.profiles.active;
+  await refreshProfiles();
+  if (wasActive) await selectProfile(state.profiles.active, { force: true });
+  flashStatus('Сборка «' + p.name + '» удалена' + (res.trashed ? ' — папка в корзине' : ''));
+});
+
+// ── перенос из Prism Launcher ──
+const prismUi = { overlay: $('prism-overlay'), roots: [], root: null, running: false };
+
+function prismItemSub(i) {
+  const bits = ['Minecraft ' + i.mc, loaderName(i.loader)];
+  if (i.stats) {
+    if (i.stats.mods) bits.push(modsWord(i.stats.mods));
+    if (i.stats.saves) bits.push('миров: ' + i.stats.saves);
+  }
+  const played = fmtPlayTime(i.playTimeMs);
+  if (played) bits.push('сыграно ' + played);
+  return bits.join(' · ');
+}
+
+function renderPrismRoot() {
+  const list = $('prism-list');
+  const extra = $('prism-extra');
+  list.replaceChildren();
+  extra.replaceChildren();
+  const r = prismUi.root;
+  if (!r) {
+    $('prism-src-label').textContent = 'Prism Launcher не найден';
+    const empty = document.createElement('div');
+    empty.className = 'prism-empty';
+    empty.innerHTML = 'Не нашли Prism на этом компьютере.<br>Нажми <b>«Указать папку…»</b> и выбери папку Prism — '
+      + 'обычно это <b>%APPDATA%\\PrismLauncher</b> (в ней лежат instances и prismlauncher.cfg).';
+    list.appendChild(empty);
+    $('prism-run').disabled = true;
+    return;
+  }
+  $('prism-src-label').textContent = (r.label || 'Prism Launcher') + ' · ' + r.root;
+  const imported = new Set((state.profiles.list || []).map((p) => p.name));
+  for (const i of r.instances) {
+    const row = document.createElement('label');
+    row.className = 'prism-item';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.value = i.id;
+    cb.addEventListener('change', updatePrismRunBtn);
+    const ic = profileIcon({ icon: i.icon || 'grass' });
+    if (i.iconFile) ic.title = 'свой значок из Prism — перенесётся';
+    const text = document.createElement('div');
+    text.className = 'prism-item-text';
+    const n = document.createElement('div');
+    n.className = 'prism-item-name';
+    n.textContent = i.name + (i.group ? '  ·  ' + i.group : '');
+    const sub = document.createElement('div');
+    sub.className = 'prism-item-sub';
+    sub.textContent = prismItemSub(i);
+    text.append(n, sub);
+    const warn = [];
+    if (imported.has(i.name)) warn.push('уже есть сборка с таким названием — перенесётся копией');
+    if (i.extras && i.extras.length) warn.push('OptiFine/LiteLoader не переносятся');
+    if (!i.gameDir) warn.push('в инстансе нет папки игры — перенесутся только настройки сборки');
+    if (warn.length) {
+      const w = document.createElement('div');
+      w.className = 'prism-item-warn';
+      w.textContent = warn.join(' · ');
+      text.appendChild(w);
+    }
+    row.append(cb, ic, text);
+    list.appendChild(row);
+  }
+  if (!r.instances.length) {
+    const empty = document.createElement('div');
+    empty.className = 'prism-empty';
+    empty.textContent = 'В этой папке Prism нет сборок.';
+    list.appendChild(empty);
+  }
+  // аккаунты: офлайн-ники переносим, лицензию — вход заново
+  const offline = r.accounts.filter((a) => a.type === 'offline');
+  const msa = r.accounts.filter((a) => a.type === 'msa');
+  if (offline.length) {
+    const l = document.createElement('label');
+    l.className = 'checkbox';
+    l.innerHTML = '<input id="prism-acc" type="checkbox" checked /><span></span>';
+    l.querySelector('span').textContent = 'Добавить ники из Prism: ' + offline.map((a) => a.name).join(', ');
+    extra.appendChild(l);
+  }
+  if (msa.length) {
+    const h = document.createElement('span');
+    h.className = 'hint';
+    h.textContent = 'Лицензия (' + msa.map((a) => a.name).join(', ') + '): войди через Microsoft кнопкой «Войти» вверху — '
+      + 'вход из Prism не переносится, так безопаснее.';
+    extra.appendChild(h);
+  }
+  updatePrismRunBtn();
+}
+
+function prismChosen() {
+  return [...$('prism-list').querySelectorAll('input[type=checkbox]:checked')].map((x) => x.value);
+}
+function updatePrismRunBtn() {
+  const n = prismChosen().length;
+  const acc = $('prism-acc');
+  const btn = $('prism-run');
+  btn.disabled = prismUi.running || (!n && !(acc && acc.checked));
+  btn.textContent = n ? 'Перенести ' + (n === 1 ? '1 сборку' : n + (n < 5 ? ' сборки' : ' сборок')) : 'Перенести ники';
+}
+
+async function openPrismImport() {
+  if (prismUi.running) { openOverlay(prismUi.overlay); return; }
+  $('prism-results').hidden = true;
+  $('prism-progress').hidden = true;
+  $('prism-done').hidden = true;
+  $('prism-run').hidden = false;
+  $('prism-src-label').textContent = 'Ищу Prism Launcher…';
+  $('prism-list').replaceChildren();
+  $('prism-extra').replaceChildren();
+  openOverlay(prismUi.overlay);
+  const res = await window.api.prismScan();
+  prismUi.roots = (res && res.roots) || [];
+  prismUi.root = prismUi.roots[0] || null;
+  renderPrismRoot();
+}
+
+$('prism-close').addEventListener('click', () => closeOverlay(prismUi.overlay));
+prismUi.overlay.addEventListener('click', (e) => { if (e.target === prismUi.overlay && !prismUi.running) closeOverlay(prismUi.overlay); });
+$('prism-extra').addEventListener('change', updatePrismRunBtn);
+$('prism-browse').addEventListener('click', async () => {
+  const res = await window.api.prismPick();
+  if (!res) return;
+  if (!res.ok) { $('prism-src-label').textContent = res.error; return; }
+  prismUi.root = res.root;
+  renderPrismRoot();
+});
+$('prism-run').addEventListener('click', async () => {
+  const r = prismUi.root;
+  if (!r || prismUi.running) return;
+  if (state.busy) { flashStatus('Перенос — между запусками: сначала закрой игру'); return; }
+  const ids = prismChosen();
+  const acc = $('prism-acc');
+  prismUi.running = true;
+  updatePrismRunBtn();
+  $('prism-progress').hidden = false;
+  $('prism-results').hidden = true;
+  const res = await window.api.prismImport(r.root, ids, !!(acc && acc.checked));
+  prismUi.running = false;
+  $('prism-progress').hidden = true;
+  const out = $('prism-results');
+  const lines = [];
+  for (const it of (res && res.report) || []) {
+    lines.push('✔ ' + it.name + ' — модов: ' + it.mods + ', файлов: ' + it.files);
+    if (it.blocked.length) lines.push('   ⛔ не перенесены (запрещены на Mist MC): ' + it.blocked.join(', '));
+    for (const n of it.notes) lines.push('   ⓘ ' + n);
+  }
+  if (res && res.addedNicks && res.addedNicks.length) lines.push('✔ Ники добавлены: ' + res.addedNicks.join(', '));
+  if (!res || !res.ok) lines.push('✖ ' + ((res && res.error) || 'Перенос не удался'));
+  out.textContent = lines.join('\n') || 'Ничего не перенесено.';
+  out.hidden = false;
+  if (res && res.accounts) applyAccounts(res);
+  $('prism-run').hidden = true;
+  $('prism-done').hidden = false;
+  $('prism-banner').hidden = true;
+  // перенесённая сборка уже выбрана в главном процессе — окно догоняет
+  applyConfig(await window.api.getConfig());
+  updateAccountUI();
+});
+$('prism-done').addEventListener('click', () => {
+  closeOverlay(prismUi.overlay);
+  setTab('game');
+});
+if (window.api.onImportProgress) {
+  window.api.onImportProgress((d) => {
+    if (!d) return;
+    const pct = d.total ? Math.round((d.done / d.total) * 100) : 0;
+    $('prism-progress-text').textContent = 'Переношу ' + d.title + (d.file ? ' · ' + d.file : '') + ' — ' + pct + '%';
+    $('prism-progress-bar').style.width = pct + '%';
+  });
+}
+if (window.api.onProfilesChanged) window.api.onProfilesChanged(() => refreshProfiles());
+
+$('btn-prism').addEventListener('click', openPrismImport);
+$('btn-prism-footer').addEventListener('click', openPrismImport);
+$('prism-banner-go').addEventListener('click', openPrismImport);
+
+// Плашка «Переходишь с Prism?»: Prism на компьютере есть, а из него ещё ничего
+// не переносили и плашку не закрывали
+const PRISM_BANNER_KEY = 'mistmc.prismBannerClosed';
+async function checkPrismBanner() {
+  let closed = false;
+  try { closed = localStorage.getItem(PRISM_BANNER_KEY) === '1'; } catch (_) { /* без хранилища — покажем */ }
+  if (closed || (state.profiles.list || []).some((p) => p.source === 'prism')) return;
+  const res = await window.api.prismScan().catch(() => null);
+  const n = ((res && res.roots) || []).reduce((a, r) => a + r.instances.length, 0);
+  if (!n) return;
+  $('prism-banner-sub').textContent = 'Нашли ' + (n === 1 ? '1 сборку' : n + (n < 5 ? ' сборки' : ' сборок'))
+    + ' в Prism — перенесём целиком: моды, миры и настройки. Prism ничего не потеряет.';
+  $('prism-banner').hidden = false;
+}
+$('prism-banner-close').addEventListener('click', () => {
+  $('prism-banner').hidden = true;
+  try { localStorage.setItem(PRISM_BANNER_KEY, '1'); } catch (_) { /* не запомнили — покажем ещё раз */ }
+});
+
 // ── init ────────────────────────────────────────────────────────────────
 async function init() {
-  const { config, versionInfo, gameVersions, account, accounts, bgMedia, arch } = await window.api.getConfig();
+  const res = await window.api.getConfig();
+  const { config, bgMedia, arch } = res;
   // тему применяем первым делом, чтобы не мигнуть стандартной
   state.theme = config.theme || {};
   state.bgMedia = bgMedia || null;
@@ -3279,6 +3884,15 @@ async function init() {
       if (hi) hi.textContent = '1 ГБ';
     }
   }
+  applyConfig(res);
+  updateAccountUI();
+  if (!state.account) openLogin();
+  refreshGameVersions();
+  checkPrismBanner();
+}
+
+/** Всё, что зависит от выбранной сборки: версия, загрузчик, память, папка. */
+function applyConfig({ config, versionInfo, gameVersions, account, accounts, profiles }) {
   els.ram.value = Math.min(config.ram || 4096, parseInt(els.ram.max, 10));
   els.ramVal.textContent = els.ram.value;
   els.joinServer.checked = config.joinServer !== false;
@@ -3286,22 +3900,24 @@ async function init() {
   state.gameDir = config.gameDir || '';
   els.gameDir.value = state.gameDir;
   state.loader = config.loader || 'fabric';
-  state.account = account || null;
-  state.accounts = accounts || [];
+  if (account !== undefined) state.account = account || null;
+  if (accounts) state.accounts = accounts;
+  if (profiles) state.profiles = profiles;
   state.versionInfo = versionInfo || {};
   state.mc = config.mcVersion || versionInfo.mc;
   state.gameVersions = gameVersions && gameVersions.length
     ? gameVersions : [{ id: state.mc, server: true, java: 21, supported: true, reason: '' }];
-
-  for (const btn of els.loader.querySelectorAll('.seg')) {
-    btn.classList.toggle('active', btn.dataset.val === state.loader);
-  }
+  // папку своей сборки не переносят «Обзором» — она её собственная
+  els.btnDir.hidden = !isMain();
+  renderLoaderSeg();
   renderMcSelect();
+  renderProfiles();
   updateVersionUI();
-  updateAccountUI();
-  if (!state.account) openLogin();
-  // свежий список версий из манифеста Mojang: вышедшая версия игры появляется
-  // в выборе без обновления лаунчера
+}
+
+// свежий список версий из манифеста Mojang: вышедшая версия игры появляется
+// в выборе без обновления лаунчера
+function refreshGameVersions() {
   window.api.gameVersions().then((res) => {
     if (!res || !res.gameVersions || !res.gameVersions.length) return;
     state.gameVersions = res.gameVersions;
@@ -3314,16 +3930,20 @@ async function init() {
 // ── события ─────────────────────────────────────────────────────────────
 els.ram.addEventListener('input', () => { els.ramVal.textContent = els.ram.value; });
 els.ram.addEventListener('change', persist);
-els.joinServer.addEventListener('change', persist);
+els.joinServer.addEventListener('change', () => { persist(); if (!isMain()) updateVersionUI(); });
 els.discordRpc.addEventListener('change', persist);
 
-els.loader.addEventListener('click', (e) => {
+els.loader.addEventListener('click', async (e) => {
   const btn = e.target.closest('.seg');
-  if (!btn) return;
+  if (!btn || btn.dataset.val === state.loader) return;
+  if (state.busy) { els.status.textContent = 'Загрузчик меняют между запусками — сначала закрой игру'; return; }
   state.loader = btn.dataset.val;
   for (const b of els.loader.querySelectorAll('.seg')) b.classList.toggle('active', b === btn);
   updateLoaderHint();
-  persist();
+  await persist();
+  // в списке сборок слева — новый загрузчик; каталог модов — под него
+  state.lastHits = [];
+  refreshProfiles();
 });
 
 els.mcSelect.addEventListener('change', async () => {
@@ -3340,6 +3960,7 @@ els.mcSelect.addEventListener('change', async () => {
   applyGameVersion(res);
   els.status.textContent = 'Версия игры: ' + state.mc
     + (res.notes && res.notes.length ? ' · ' + res.notes.join(' · ') : '');
+  refreshProfiles();
 });
 
 /** Версия игры сменилась (выбором в окне или под мир друга) — всё, что от неё зависит. */
@@ -3515,8 +4136,10 @@ window.api.onState((s) => {
   if (s.state === 'running') {
     els.status.textContent = 'Игра запущена';
     setProgress(100);
+    refreshProfiles(); // зелёная точка у запущенной сборки
   } else if (s.state === 'idle') {
     setBusy(false);
+    refreshProfiles();
   } else if (s.state === 'working') {
     setBusy(true);
   }

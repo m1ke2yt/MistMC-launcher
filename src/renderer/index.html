@@ -79,6 +79,15 @@
     <symbol id="ic-trash" viewBox="0 0 24 24">
       <path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/>
     </symbol>
+    <symbol id="ic-folder" viewBox="0 0 24 24">
+      <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2.5h6.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/>
+    </symbol>
+    <symbol id="ic-import" viewBox="0 0 24 24">
+      <path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2.5A1.5 1.5 0 0 0 5.5 21h13a1.5 1.5 0 0 0 1.5-1.5V17"/>
+    </symbol>
+    <symbol id="ic-copy" viewBox="0 0 24 24">
+      <rect x="8" y="8" width="13" height="13" rx="2.5"/><path d="M16 8V5.5A2.5 2.5 0 0 0 13.5 3h-8A2.5 2.5 0 0 0 3 5.5v8A2.5 2.5 0 0 0 5.5 16H8"/>
+    </symbol>
     <symbol id="ic-newwin" viewBox="0 0 24 24">
       <rect x="3" y="8" width="13" height="13" rx="2.5"/><path d="M8 3h10.5A2.5 2.5 0 0 1 21 5.5V16"/>
     </symbol>
@@ -90,7 +99,7 @@
       <span class="subtitle">Launcher</span>
     </div>
     <nav class="tabs" id="tabs">
-      <button class="tab active" data-tab="game">Игра</button>
+      <button class="tab active" data-tab="game">Сборки</button>
       <button class="tab" data-tab="mods">Моды</button>
       <!-- Косметика временно скрыта: снять hidden здесь и COSMETICS_ENABLED=true
            в renderer.js, чтобы вернуть вкладку -->
@@ -126,15 +135,62 @@
 
   <!-- ══ Вкладка «Игра» ══ -->
   <main id="view-game">
-    <div class="hero">
-      <div class="hero-title">Mist MC</div>
-      <div class="hero-sub">Minecraft <span id="mc-ver">1.21.11</span> · вход по нику или лицензии Microsoft</div>
+   <div class="game-layout">
+    <!-- Сборки, как инстансы в Prism: у каждой своя версия, моды и миры -->
+    <aside class="inst-side">
+      <div class="inst-side-head">
+        <span>Мои сборки</span>
+        <button id="btn-inst-new" class="inst-add" title="Новая сборка">+</button>
+      </div>
+      <div class="inst-list" id="inst-list"></div>
+      <button id="btn-prism" class="inst-prism" title="Перенести сборки, моды и миры из Prism Launcher">
+        <svg class="ic"><use href="#ic-import"/></svg><span>Перенести из Prism</span>
+      </button>
+    </aside>
+
+    <section class="inst-main" id="inst-main">
+    <!-- первый запуск после Prism: предлагаем перенести всё одной кнопкой -->
+    <div class="prism-banner" id="prism-banner" hidden>
+      <div class="prism-banner-text">
+        <b>Переходишь с Prism Launcher?</b>
+        <span id="prism-banner-sub">Нашли твои сборки — перенесём их целиком: моды, миры и настройки.</span>
+      </div>
+      <button id="prism-banner-go" class="btn-accent">Перенести</button>
+      <button id="prism-banner-close" class="winbtn" title="Скрыть">✕</button>
+    </div>
+
+    <div class="inst-head">
+      <div class="inst-icon inst-icon-big" id="inst-icon"></div>
+      <div class="inst-head-text">
+        <div class="inst-title" id="inst-title">Mist MC</div>
+        <div class="inst-sub"><span>Minecraft <span id="mc-ver">1.21.11</span></span><span id="inst-sub-rest"></span></div>
+      </div>
+      <div class="inst-actions">
+        <div class="menu-wrap">
+          <button id="btn-inst-folder" class="btn-secondary" title="Открыть папку сборки">
+            <svg class="ic"><use href="#ic-folder"/></svg> Папка ▾
+          </button>
+          <div class="pop-menu" id="folder-menu" hidden>
+            <button data-sub="">Вся папка сборки</button>
+            <button data-sub="mods">Моды</button>
+            <button data-sub="resourcepacks">Ресурспаки</button>
+            <button data-sub="shaderpacks">Шейдеры</button>
+            <button data-sub="saves">Миры</button>
+            <button data-sub="screenshots">Скриншоты</button>
+            <button data-sub="config">Настройки модов</button>
+            <button data-sub="logs">Журналы игры</button>
+          </div>
+        </div>
+        <button id="btn-inst-edit" class="btn-secondary" title="Название, значок, копия, удаление">
+          <svg class="ic"><use href="#ic-gear"/></svg> Настроить
+        </button>
+      </div>
     </div>
 
     <div class="card">
-      <div class="row">
+      <div class="row row-game">
         <label class="field field-mc">
-          <span class="label">Версия игры</span>
+          <span class="label">Версия Minecraft</span>
           <select id="mc-select" class="select">
             <option value="1.21.11">1.21.11</option>
           </select>
@@ -142,7 +198,7 @@
         </label>
 
         <label class="field field-loader">
-          <span class="label">Сборка</span>
+          <span class="label">Загрузчик модов</span>
           <div class="segmented" id="loader">
             <button data-val="fabric" class="seg active">Fabric</button>
             <button data-val="forge" class="seg">Forge</button>
@@ -150,7 +206,8 @@
           </div>
           <span class="hint" id="loader-hint">Fabric — рекомендуется, с модами Mist MC</span>
         </label>
-
+      </div>
+      <div class="row">
         <label class="field field-ram">
           <span class="label">Оперативная память: <b id="ram-val">4096</b> МБ</span>
           <input id="ram" type="range" min="2048" max="16384" step="512" value="4096" />
@@ -174,16 +231,27 @@
       <details class="advanced">
         <summary>Дополнительно</summary>
         <label class="field">
-          <span class="label">Папка игры</span>
+          <span class="label">Папка сборки</span>
           <div class="row-inline">
             <input id="gameDir" type="text" readonly />
             <button id="btn-dir" class="btn-secondary">Обзор…</button>
-            <button id="btn-open-dir" class="btn-secondary" title="Открыть папку игры в проводнике">Открыть папку</button>
+            <button id="btn-open-dir" class="btn-secondary" title="Открыть папку в проводнике">Открыть папку</button>
           </div>
         </label>
-        <button id="btn-migrate" class="btn-secondary">Перенести настройки из другого лаунчера</button>
+        <button id="btn-migrate" class="btn-secondary">Перенести настройки из TLauncher и других лаунчеров</button>
       </details>
     </div>
+
+    <!-- быстрые кнопки, как страницы инстанса в Prism -->
+    <div class="inst-quick" id="inst-quick">
+      <button data-go="mod"><svg class="ic"><use href="#ic-puzzle"/></svg>Моды <b id="quick-mods"></b></button>
+      <button data-go="resourcepack"><svg class="ic"><use href="#ic-palette"/></svg>Ресурспаки</button>
+      <button data-go="shader"><svg class="ic"><use href="#ic-sparkle"/></svg>Шейдеры</button>
+      <button data-open="saves"><svg class="ic"><use href="#ic-map"/></svg>Миры</button>
+      <button data-open="screenshots"><svg class="ic"><use href="#ic-image"/></svg>Скриншоты</button>
+    </div>
+    </section>
+   </div>
 
     <div class="launch-area">
       <div class="progress-wrap">
@@ -201,7 +269,9 @@
       <span id="ver-line">Fabric 0.19.3 / Forge 61.1.0</span>
       <span class="footer-right">
         <button id="btn-update" class="btn-update" hidden>⬆ Обновить</button>
-        <button id="btn-migrate-footer" class="link">перенос из другого лаунчера</button>
+        <button id="btn-prism-footer" class="link">перенос из Prism</button>
+        <span class="dot">·</span>
+        <button id="btn-migrate-footer" class="link">из других лаунчеров</button>
         <span class="dot">·</span>
         <button id="btn-log" class="link">лог</button>
       </span>
@@ -249,8 +319,8 @@
 
     <div class="mods-vanilla" id="mods-vanilla" hidden>
       <div class="mods-vanilla-icon"><svg class="ic"><use href="#ic-puzzle"/></svg></div>
-      <p>Моды работают на <b>Fabric</b> или <b>Forge</b>.</p>
-      <p class="hint">Выбери сборку на вкладке «Игра», и здесь появится каталог модов.</p>
+      <p>В этой сборке нет загрузчика модов (<b>Vanilla</b>).</p>
+      <p class="hint">Выбери Fabric, Forge, NeoForge или Quilt на вкладке «Сборки» — и здесь появится каталог модов.</p>
     </div>
   </main>
 
@@ -615,7 +685,8 @@
             <span class="mig-name">Данные модов</span>
             <span class="mig-desc">вейпоинты · схематики · эмоции</span></label>
         </div>
-        <span class="hint">Моды не переносятся — ставь во вкладке «Моды»: там всё проверено и под нашу версию.</span>
+        <span class="hint">Моды отсюда не переносятся — ставь во вкладке «Моды»: там всё проверено и под нашу версию.
+          Из <b>Prism Launcher</b> сборки переносятся целиком, с модами, — кнопка «Перенести из Prism» на вкладке «Сборки».</span>
       </div>
 
       <div class="modal-block">
@@ -623,6 +694,90 @@
         <div class="migrate-results" id="migrate-results" hidden></div>
       </div>
     </div>
+  </div>
+
+  <!-- ══ Новая сборка / настройки сборки ══ -->
+  <div class="overlay" id="inst-overlay" hidden>
+    <div class="modal modal-inst">
+      <div class="modal-head">
+        <span class="modal-title" id="inst-modal-title">Новая сборка</span>
+        <button id="inst-modal-close" class="winbtn">✕</button>
+      </div>
+      <div class="modal-block">
+        <span class="label">Название</span>
+        <input id="inst-name" type="text" maxlength="40" placeholder="Например: Выживание с друзьями" />
+      </div>
+      <div class="modal-block">
+        <span class="label">Значок</span>
+        <div class="icon-grid" id="inst-icons"></div>
+      </div>
+      <div class="modal-block" id="inst-create-only">
+        <span class="label">Версия Minecraft</span>
+        <select id="inst-mc" class="select"></select>
+        <span class="label" style="margin-top:6px">Загрузчик модов</span>
+        <div class="segmented seg-5" id="inst-loader"></div>
+        <span class="hint" id="inst-loader-hint"></span>
+      </div>
+      <div class="modal-block" id="inst-edit-only">
+        <label class="checkbox" id="inst-mist-row">
+          <input id="inst-mist" type="checkbox" />
+          <span>Моды <b>Mist MC</b> в этой сборке: плащи, друзья, модели игроков</span>
+        </label>
+        <div class="inst-danger">
+          <button id="inst-dup" class="btn-secondary"><svg class="ic"><use href="#ic-copy"/></svg> Сделать копию</button>
+          <button id="inst-del" class="btn-secondary btn-danger"><svg class="ic"><use href="#ic-trash"/></svg> Удалить сборку</button>
+        </div>
+        <div class="inst-del-confirm" id="inst-del-confirm" hidden>
+          <span>Удалить сборку из списка?</span>
+          <label class="checkbox"><input id="inst-del-files" type="checkbox" checked /><span>Убрать её папку в корзину (моды, миры, настройки)</span></label>
+          <div class="row-inline">
+            <button id="inst-del-yes" class="btn-accent btn-danger-solid">Удалить</button>
+            <button id="inst-del-no" class="btn-secondary">Отмена</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-block">
+        <button id="inst-save" class="btn-accent">Создать</button>
+        <span class="hint hint-error" id="inst-error" hidden></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ Перенос из Prism Launcher ══ -->
+  <div class="overlay" id="prism-overlay" hidden>
+    <div class="modal modal-wide modal-prism">
+      <div class="modal-head">
+        <span class="modal-title">Перенос из Prism Launcher</span>
+        <button id="prism-close" class="winbtn">✕</button>
+      </div>
+      <p class="mig-sub">Каждая сборка переедет целиком: моды, миры, настройки, ресурспаки и шейдеры.
+        Prism ничего не потеряет — мы только копируем.</p>
+      <div class="prism-src">
+        <span id="prism-src-label">Ищу Prism Launcher…</span>
+        <button id="prism-browse" class="btn-secondary">Указать папку…</button>
+      </div>
+      <div class="prism-list" id="prism-list"></div>
+      <div class="prism-extra" id="prism-extra"></div>
+      <span class="hint">Читы и запрещённые на Mist MC моды (X-Ray, Freecam со сквозными стенами, JourneyMap…) не переносятся — покажем, какие именно.</span>
+      <div class="prism-progress" id="prism-progress" hidden>
+        <div class="status" id="prism-progress-text"></div>
+        <div class="progress"><div class="progress-bar" id="prism-progress-bar"></div></div>
+      </div>
+      <div class="migrate-results" id="prism-results" hidden></div>
+      <div class="row-inline prism-foot">
+        <button id="prism-run" class="btn-accent">Перенести</button>
+        <button id="prism-done" class="btn-accent" hidden>Готово — к сборкам</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- меню по правому клику на сборке -->
+  <div class="pop-menu ctx-menu" id="inst-ctx" hidden>
+    <button data-act="play">Играть</button>
+    <button data-act="edit">Настроить…</button>
+    <button data-act="folder">Открыть папку</button>
+    <button data-act="dup">Сделать копию</button>
+    <button data-act="del" class="danger">Удалить…</button>
   </div>
 
   <!-- Плашка режима настройки блоков: видна только когда body.blocks-edit -->

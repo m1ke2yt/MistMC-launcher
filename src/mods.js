@@ -135,34 +135,40 @@ function entryFitsMc(e, mc) { return (e.type || 'mod') !== 'mod' || entryMcSet(e
 
 const agent = new Agent({ connect: { timeout: 10000 }, headersTimeout: 15000, bodyTimeout: 300000 });
 
-// ── доступность Modrinth: прямой доступ + прокси-фолбэк через сайт ──
-// У части провайдеров прямой доступ к Modrinth деградирует/висит. Если прямой
+// ── доступность Modrinth: прямой доступ + наш прокси ──
+// У части провайдеров прямой доступ к Modrinth режется или висит. Если прямой
 // запрос не ответил заголовками за 10с — повторяем через наш прокси и
-// «прилипаем» к нему на 5 минут. Пути прокси — в build-secret.js; в сборке
-// из исходников их нет, тогда остаётся только прямой доступ.
+// «прилипаем» к нему на 30 минут. Прокси живёт на зеркале (files.mistmc.gg,
+// нормальный канал); путь через сайт — запасной (сайт редиректит туда же).
+// Адреса — в build-secret.js; в сборке из исходников их нет, тогда остаётся
+// только прямой доступ.
 const DIRECT_HEADER_TIMEOUT = 10_000;
-const PROXY_STICKY_MS = 5 * 60_000;
+const PROXY_STICKY_MS = 30 * 60_000;
 let preferProxyUntil = 0;
 
-function toProxyUrl(url) {
-  const { modrinthApi, modrinthCdn } = buildSecret.NET;
-  if (!modrinthApi || !modrinthCdn) return url;
-  // база с фолбэком: сайт, а если он заблокирован в стране игрока
+/** Адреса того же запроса через наши прокси, по порядку (пусто — прокси нет). */
+function toProxyUrls(url) {
+  const { modrinthApi, modrinthCdn, modrinthProxy } = buildSecret.NET;
+  if (!modrinthApi || !modrinthCdn) return [];
+  if (!/^https:\/\/(api|cdn)\.modrinth\.com\//.test(url)) return [];
+  // база сайта с фолбэком: сам сайт, а если он заблокирован в стране игрока
   // (Украина vs RU IP) — зеркало
-  const base = site.baseSync();
-  return url
+  const bases = [modrinthProxy, site.baseSync()].filter(Boolean);
+  const out = bases.map((base) => url
     .replace('https://api.modrinth.com/', base + modrinthApi)
-    .replace('https://cdn.modrinth.com/', base + modrinthCdn);
+    .replace('https://cdn.modrinth.com/', base + modrinthCdn));
+  return [...new Set(out)];
 }
 
 // fetch с таймаутом только на ЗАГОЛОВКИ: тело больших файлов не ограничиваем
 // (его страхует bodyTimeout агента)
-async function fetchHeaderTimeout(url, timeoutMs) {
+async function fetchHeaderTimeout(url, timeoutMs, init = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT },
+      ...init,
+      headers: { 'User-Agent': USER_AGENT, ...(init.headers || {}) },
       dispatcher: agent,
       signal: ac.signal,
     });
@@ -174,18 +180,27 @@ async function fetchHeaderTimeout(url, timeoutMs) {
   }
 }
 
-async function robustFetch(url) {
-  site.getBase().catch(() => {}); // фоновая проба, чтобы toProxyUrl знал актуальную базу
-  const proxied = toProxyUrl(url);
-  const useProxyFirst = Date.now() < preferProxyUntil && proxied !== url;
-  const order = proxied === url ? [url] : useProxyFirst ? [proxied, url] : [url, proxied];
+// Ответ прокси засчитываем, только если он и правда от прокси (метка
+// X-Mist-Proxy) или успешный: 404-страница сайта, где прокси нет, — это сбой
+// пути, а не «такого мода нет». Иначе лаунчер залипал на мёртвом прокси и
+// вкладка «Моды» целиком отвечала 404.
+function proxyAnswered(res) {
+  return res.ok || !!res.headers.get('x-mist-proxy');
+}
+
+async function robustFetch(url, init) {
+  site.getBase().catch(() => {}); // фоновая проба, чтобы toProxyUrls знал актуальную базу
+  const proxies = toProxyUrls(url);
+  const order = Date.now() < preferProxyUntil ? [...proxies, url] : [url, ...proxies];
   let lastErr = null;
   for (const attempt of order) {
+    const viaProxy = attempt !== url;
     try {
-      const res = await fetchHeaderTimeout(attempt, DIRECT_HEADER_TIMEOUT);
+      const res = await fetchHeaderTimeout(attempt, DIRECT_HEADER_TIMEOUT, init);
       if (res.status >= 500) { lastErr = new Error('HTTP ' + res.status); continue; }
-      if (attempt === proxied && proxied !== url) preferProxyUntil = Date.now() + PROXY_STICKY_MS;
-      if (attempt === url) preferProxyUntil = 0;
+      if (viaProxy && !proxyAnswered(res)) { lastErr = new Error('прокси Modrinth недоступен (HTTP ' + res.status + ')'); continue; }
+      if (viaProxy) preferProxyUntil = Date.now() + PROXY_STICKY_MS;
+      else preferProxyUntil = 0;
       return res;
     } catch (e) {
       lastErr = e;
@@ -503,6 +518,131 @@ function listContent(gameDir, type, loader, bundledDir, mc = BUNDLED_MC) {
   };
 }
 
+// ── файлы, положенные в папку мимо каталога (перенос из Prism, «Папка») ──
+// Что за мод в джарнике — по описанию любого загрузчика: fabric.mod.json,
+// quilt.mod.json, META-INF/(neoforge.)mods.toml. Нужен для названия в списке
+// и проверки на читы при переносе. null — не мод (или битый архив).
+function jarModInfo(file) {
+  let buf;
+  try { buf = fs.readFileSync(file); } catch (_) { return null; }
+  const fab = fabricInfoFromBuf(buf, 0);
+  if (fab && fab.id) return { id: String(fab.id), name: fab.name || fab.id, version: fab.version, description: '' };
+  try {
+    const q = readZipEntryBuf(buf, 'quilt.mod.json');
+    if (q) {
+      const j = JSON.parse(q.toString('utf8').replace(/^﻿/, ''));
+      const ql = (j && j.quilt_loader) || {};
+      const meta = ql.metadata || {};
+      if (ql.id) return { id: String(ql.id), name: String(meta.name || ql.id), version: String(ql.version || ''), description: String(meta.description || '') };
+    }
+  } catch (_) { /* не quilt */ }
+  for (const name of ['META-INF/neoforge.mods.toml', 'META-INF/mods.toml']) {
+    let raw = null;
+    try { raw = readZipEntryBuf(buf, name); } catch (_) { raw = null; }
+    if (!raw) continue;
+    const t = raw.toString('utf8');
+    const block = t.split(/^\s*\[\[mods\]\]\s*$/m)[1] || t;
+    const field = (k) => {
+      const m = new RegExp('^\\s*' + k + '\\s*=\\s*(?:"""([\\s\\S]*?)"""|\'\'\'([\\s\\S]*?)\'\'\'|"([^"]*)"|\'([^\']*)\')', 'm').exec(block);
+      return m ? (m[1] || m[2] || m[3] || m[4] || '').trim() : '';
+    };
+    const id = field('modId');
+    if (id) return { id, name: field('displayName') || id, version: field('version'), description: field('description') };
+  }
+  return null;
+}
+
+/**
+ * Запрещённый ли мод (читы, JourneyMap) — по описанию из джарника и имени файла.
+ * Для переноса из других лаунчеров: такое не копируем вовсе.
+ */
+function blockedJar(file, info) {
+  const base = path.basename(file).replace(/\.disabled$/i, '');
+  if (info && FAIR_FREECAM.modIds.has(info.id) && readZipEntry(file, FAIR_FREECAM.marker)) return null;
+  const rule = BLOCKED_MODS.find((r) => (info && r.ids.has(info.id)) || r.fileRe.test(base));
+  if (rule) return rule.label;
+  const text = [base, info && info.id, info && info.name, info && info.description].filter(Boolean).join(' ');
+  return isBlocked(text, info ? String(info.id).toLowerCase() : '') ? ((info && info.name) || base) : null;
+}
+
+function sha1File(file) {
+  return require('crypto').createHash('sha1').update(fs.readFileSync(file)).digest('hex');
+}
+
+/**
+ * Записать в реестр то, что лежит в папке типа, но лаунчеру не известно:
+ * джарники/архивы, перенесённые из Prism или закинутые руками через «Папка».
+ * Тогда они видны во вкладке «Моды» и переключаются как установленные из
+ * каталога. Что есть на Modrinth (по sha1) — с названием, значком и версией;
+ * остальное — по описанию из самого джарника. Сеть недоступна — записываем без
+ * Modrinth, в следующий раз не переспрашиваем (запись уже есть).
+ * Возвращает число новых записей.
+ */
+async function adoptContent(gameDir, type, loader, mc, bundledDir, log = () => {}) {
+  const t = typeInfo(type);
+  const dir = contentDir(gameDir, type);
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch (_) { return 0; }
+  const m = readManifest(gameDir);
+  const known = new Set();
+  for (const e of m.user) {
+    if (e.type !== type) continue;
+    for (const v of entryFileVariants(gameDir, e)) known.add(path.basename(v).toLowerCase());
+  }
+  const bundled = type === 'mod' ? new Set([...allBundled(bundledDir).keys()].map((f) => f.toLowerCase())) : new Set();
+  const ext = type === 'mod' ? /\.jar(\.disabled)?$/i : /\.zip(\.disabled)?$/i;
+  const fresh = [];
+  for (const f of names) {
+    if (!ext.test(f)) continue;
+    const lower = f.toLowerCase();
+    if (known.has(lower) || bundled.has(lower)) continue;
+    const enabled = !/\.disabled$/i.test(f);
+    const fileName = f.replace(/\.disabled$/i, '');
+    if (!enabled && names.includes(fileName)) continue; // рядом включённая копия — её и берём
+    if (fresh.some((x) => x.fileName.toLowerCase() === fileName.toLowerCase())) continue;
+    const full = path.join(dir, f);
+    let sha1 = null;
+    try { sha1 = sha1File(full); } catch (_) { continue; }
+    fresh.push({ fileName, enabled, full, sha1, info: type === 'mod' ? jarModInfo(full) : null });
+  }
+  if (!fresh.length) return 0;
+
+  let byHash = {};
+  let projects = new Map();
+  try {
+    byHash = await versionsByHash(fresh.map((x) => x.sha1));
+    const ids = [...new Set(Object.values(byHash).map((v) => v && v.project_id).filter(Boolean))];
+    if (ids.length) projects = await projectsById(ids);
+  } catch (e) {
+    log('ⓘ Modrinth недоступен — файлы записаны без значков и названий из каталога (' + e.message + ')');
+  }
+
+  const cur = readManifest(gameDir);
+  for (const x of fresh) {
+    const v = byHash[x.sha1];
+    const pr = v && projects.get(v.project_id);
+    cur.user.push({
+      projectId: v ? v.project_id : undefined,
+      slug: pr ? pr.slug : undefined,
+      title: (pr && pr.title) || (x.info && x.info.name) || x.fileName.replace(/\.(jar|zip)$/i, ''),
+      iconUrl: (pr && pr.icon_url) || '',
+      fileName: x.fileName,
+      type,
+      loader: t.perLoader ? loader : null,
+      enabled: x.enabled,
+      versionNumber: (v && v.version_number) || (x.info && x.info.version) || '',
+      versionId: v ? v.id : undefined,
+      // подходит той версии игры, в папке которой лежал: заявленные версии
+      // Modrinth не берём — в чужих сборках моды нередко стоят «не по паспорту»
+      mc,
+      manual: v ? undefined : true,
+    });
+  }
+  writeManifest(gameDir, cur);
+  log('ⓘ Записано в список: ' + fresh.length + ' (' + type + ')');
+  return fresh.length;
+}
+
 // ── поиск ───────────────────────────────────────────────────────────────
 function hitToItem(h) {
   return {
@@ -520,7 +660,7 @@ async function searchContent(query, type, loader, mcVersion) {
   // версийный фасет — только для модов: паки/шейдеры кроссверсионные и редко
   // декларируют новейшую MC (поиск «Glowing» отдавал пусто именно из-за этого)
   const facets = [['project_type:' + t.projectType]];
-  if (type === 'mod') facets.push(['versions:' + mcVersion], ['categories:' + loader]);
+  if (type === 'mod') facets.push(['versions:' + mcVersion], loaderFacet(loader));
   if (type === 'shader') facets.push(['categories:iris']);
   const url = API + '/search?limit=20&query=' + encodeURIComponent(query || '')
     + '&facets=' + encodeURIComponent(JSON.stringify(facets))
@@ -598,9 +738,14 @@ async function projectDetails(idOrSlug) {
 }
 
 // ── установка (с обязательными зависимостями) ───────────────────────────
+/** Фасет поиска Modrinth по загрузчику (внутри — ИЛИ). */
+function loaderFacet(loader) { return versionLoaders('mod', loader).map((l) => 'categories:' + l); }
+
 function versionLoaders(type, loader) {
   if (type === 'resourcepack') return ['minecraft'];
   if (type === 'shader') return ['iris'];
+  // Quilt грузит и моды Fabric
+  if (loader === 'quilt') return ['quilt', 'fabric'];
   return [loader];
 }
 
@@ -1847,13 +1992,15 @@ async function tryReplace(gameDir, loader, mcVersion, log, state, conflict, slot
 // иначе Forge спотыкается о fabric-джарники и наоборот); вшитая сборка Mist MC
 // докладывается для Fabric с учётом выключенных. Паки/шейдеры не трогаем —
 // они кроссверсионные и не зависят от загрузчика.
-function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC) {
+// opts.noBundled — своя сборка без модов Mist MC (выключены в её настройках):
+// вшитые джарники из её папки убираем все, не докладывая ни одного
+function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC, opts = {}) {
   bundledDirSeen = bundledDir;
   fs.mkdirSync(contentDir(gameDir, 'mod'), { recursive: true });
   const m = readManifest(gameDir);
   // вшитые моды под выбранную версию игры; джарники сборок под другие версии
   // из папки модов убираем
-  const mine = bundledFor(bundledDir, loader, mc);
+  const mine = opts.noBundled ? { dir: null, jars: [] } : bundledFor(bundledDir, loader, mc);
   const bundled = mine.jars;
   const everyBundled = allBundled(bundledDir);
 
@@ -1885,7 +2032,8 @@ function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC) {
       } else if (fs.existsSync(dest)) {
         fs.unlinkSync(dest);
         log('  − мод ' + f + (applies ? ' (выключен)'
-          : loader === 'fabric' ? ' (собран под другую версию игры)' : ' (не для ' + loader + ')'));
+          : opts.noBundled ? ' (моды Mist MC в этой сборке выключены)'
+            : loader === 'fabric' ? ' (собран под другую версию игры)' : ' (не для ' + loader + ')'));
       }
     } catch (e) {
       // джарник держит уже запущенная игра (второе окно мультиаккаунта) —
@@ -1922,6 +2070,32 @@ function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC) {
       try {
         fs.renameSync(path.join(dir, f), back);
         log('  + мод ' + path.basename(back) + ' (снова подходит версии игры)');
+      } catch (e) {
+        log('  ! ' + f + ': ' + e.message);
+      }
+    }
+  }
+
+  // Копию, усыплённую как дубликат (ниже), возвращаем, когда второго мода с
+  // тем же id больше нет: в сборке выключили моды Mist MC или убрали свой
+  // джарник. Иначе сборка так и осталась бы, например, без Fabric API.
+  if (loader === 'fabric') {
+    const dir = contentDir(gameDir, 'mod');
+    const activeIds = new Set();
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jar')) continue;
+      const info = fabricModInfo(path.join(dir, f));
+      if (info && info.id) activeIds.add(info.id);
+    }
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jar.dupe.disabled')) continue;
+      const info = fabricModInfo(path.join(dir, f));
+      const back = path.join(dir, f.slice(0, -'.dupe.disabled'.length));
+      if (!info || !info.id || activeIds.has(info.id) || fs.existsSync(back)) continue;
+      try {
+        fs.renameSync(path.join(dir, f), back);
+        activeIds.add(info.id);
+        log('  + мод ' + path.basename(back) + ' (дубликата больше нет)');
       } catch (e) {
         log('  ! ' + f + ': ' + e.message);
       }
@@ -2317,12 +2491,12 @@ async function applyBuild(gameDir, build, mcVersion, log, parts) {
 // не принимаем: всё идёт через каталог, со всеми запретами сервера.
 
 async function apiPost(pathname, body) {
-  const res = await fetch(API + pathname, {
+  // тоже через прокси, если прямой Modrinth режется: тело — строка, при
+  // повторе через прокси уходит заново
+  const res = await robustFetch(API + pathname, {
     method: 'POST',
-    headers: { 'User-Agent': USER_AGENT, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    dispatcher: agent,
-    signal: AbortSignal.timeout(20000),
   });
   if (!res.ok) throw new Error('Modrinth HTTP ' + res.status);
   return res.json();
@@ -2839,6 +3013,9 @@ module.exports = {
   exportBuild,
   applyBuild,
   readZipEntry,
+  jarModInfo,
+  blockedJar,
+  adoptContent,
   // разбор версий — чистые функции, вынесены наружу для тестов
   fabricModInfo,
   usesIntermediary,

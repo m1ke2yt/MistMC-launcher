@@ -14,6 +14,7 @@ module.exports = {
     mirrorDownloads: '',
     mojangProxy: '',
     packUrls: [],
+    modrinthProxy: '',
     modrinthApi: '',
     modrinthCdn: '',
     api: {

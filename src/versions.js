@@ -67,9 +67,21 @@ function withMirror(url) {
 }
 
 // ── список версий ───────────────────────────────────────────────────────
+// Java по номеру версии (для подписи в списке и проверки «запустится ли»; при
+// запуске берётся точное значение из version.json). Старым версиям — своя.
 function javaMajorGuess(mc) {
-  return parseInt(String(mc).split('.')[0], 10) >= 26 ? 25 : BUNDLED_JAVA_MAJOR;
+  const p = String(mc).split('.').map((x) => parseInt(x, 10) || 0);
+  if (p[0] >= 26) return 25;
+  if (p[0] !== 1) return BUNDLED_JAVA_MAJOR;
+  const minor = p[1];
+  const patch = p[2] || 0;
+  if (minor > 20 || (minor === 20 && patch >= 5)) return BUNDLED_JAVA_MAJOR;
+  if (minor >= 18) return 17;
+  if (minor === 17) return 16;
+  return 8;
 }
+// Вшитая Java 21 запускает и версии, которым по паспорту нужна 17
+const BUNDLED_JAVA_MIN = 17;
 
 /** Ключ платформы в индексе Java-рантаймов Mojang (null — рантаймов нет). */
 function runtimePlatform() {
@@ -85,7 +97,7 @@ function runtimePlatform() {
  * выпускает, поэтому 26.x в 32-битной сборке лаунчера недоступны.
  */
 function unsupportedReason(mc) {
-  if (javaMajorGuess(mc) <= BUNDLED_JAVA_MAJOR) return '';
+  if (javaMajorGuess(mc) <= BUNDLED_JAVA_MAJOR) return ''; // вшитая или старая (Java 8 есть и для 32 бит)
   const plat = runtimePlatform();
   if (!plat || plat === 'windows-x86' || plat === 'linux-i386') {
     return 'Minecraft ' + mc + ' работает только на 64-битной системе';
@@ -132,6 +144,26 @@ function gameVersions(manifest) {
   return describeVersions(ids, latest);
 }
 
+/**
+ * Все релизы Minecraft из манифеста (для своих сборок, как в Prism), свежие
+ * сверху. Главная сборка «Mist MC» по-прежнему берёт gameVersions().
+ */
+function allReleases(manifest) {
+  const list = manifest || readCache('version_manifest.json');
+  const all = Array.isArray(list && list.versions) ? list.versions : [];
+  const ids = all
+    .filter((v) => v.type === 'release')
+    .sort((a, b) => (Date.parse(b.releaseTime) || 0) - (Date.parse(a.releaseTime) || 0))
+    .map((v) => v.id);
+  const latest = (list && list.latest && list.latest.release) || ids[0];
+  return describeVersions(ids.length ? ids : FALLBACK_VERSIONS, latest);
+}
+/** Есть ли такой релиз и запустится ли он здесь (для своих сборок). */
+function releaseSupported(mc, manifest) {
+  const v = allReleases(manifest).find((x) => x.id === mc);
+  return !!(v && v.supported);
+}
+
 function isKnown(mc, manifest) {
   return gameVersions(manifest).some((v) => v.id === mc);
 }
@@ -158,6 +190,50 @@ async function forgeVersion(mc, dispatcher) {
   }
 }
 
+// ── NeoForge и Quilt (свои сборки, перенос из Prism) ────────────────────
+// NeoForge нумерует сборки по версии игры: 1.21.1 → 21.1.N, 26.3 → 26.3.0.N.
+// Под 1.20.1 NeoForge выходил ещё как net.neoforged:forge (1.20.1-47.1.N).
+const NEOFORGE_LIST = 'https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/';
+function neoforgeProject(mc) { return mc === '1.20.1' ? 'forge' : 'neoforge'; }
+function neoforgePrefixes(mc) {
+  const p = String(mc).split('.');
+  if (p[0] === '1') return [(p[1] || '0') + '.' + (p[2] || '0') + '.'];
+  return [mc + '.', p.slice(0, 2).join('.') + '.0.'];
+}
+/** Версия NeoForge в том виде, что ждёт установщик (null — под эту игру нет). */
+function neoforgeFullVersion(mc, version) {
+  if (!version) return null;
+  return neoforgeProject(mc) === 'forge' && !String(version).includes('-') ? mc + '-' + version : String(version);
+}
+async function neoforgeVersion(mc, dispatcher) {
+  const project = neoforgeProject(mc);
+  const cacheName = 'neoforge-' + project + '.json';
+  let list = null;
+  try {
+    const j = await fetchJsonAny([NEOFORGE_LIST + project], dispatcher, 15000);
+    if (j && Array.isArray(j.versions)) { list = j.versions; writeCache(cacheName, list); }
+  } catch (e) {
+    ctx.log('ⓘ Список версий NeoForge недоступен (' + (e && e.message) + ') — беру сохранённый');
+  }
+  list = list || readCache(cacheName) || [];
+  const fits = project === 'forge'
+    ? list.filter((v) => String(v).startsWith(mc + '-'))
+    : list.filter((v) => neoforgePrefixes(mc).some((pre) => String(v).startsWith(pre)));
+  const stable = fits.filter((v) => !/beta|alpha/i.test(v));
+  return (stable.length ? stable : fits).slice(-1)[0] || null;
+}
+
+const QUILT_LOADERS_URL = 'https://meta.quiltmc.org/v3/versions/loader';
+/** Свежий стабильный Quilt Loader (null — мета недоступна и кэша нет). */
+async function quiltLoaderVersion(dispatcher) {
+  try {
+    const list = await fetchJsonAny([QUILT_LOADERS_URL], dispatcher, 15000);
+    const pick = (list || []).map((x) => x && x.version).find((v) => v && !/beta|alpha|pre/i.test(v));
+    if (pick) { writeCache('quilt-loader.json', pick); return pick; }
+  } catch (_) { /* ниже — сохранённый */ }
+  return readCache('quilt-loader.json');
+}
+
 // ── Java ────────────────────────────────────────────────────────────────
 function javaExeName() { return process.platform === 'win32' ? 'javaw.exe' : 'java'; }
 function runtimeDir(component) { return path.join(ctx.dataDir, 'runtime', component); }
@@ -182,9 +258,14 @@ function installedRuntime(component) {
 async function ensureJava({ versionJson, bundledJava, installer, dl, runTask }) {
   const jv = (versionJson && versionJson.javaVersion) || {};
   const major = Number(jv.majorVersion) || BUNDLED_JAVA_MAJOR;
-  if (major <= BUNDLED_JAVA_MAJOR) return { javaPath: bundledJava, major: BUNDLED_JAVA_MAJOR };
+  if (major <= BUNDLED_JAVA_MAJOR && major >= BUNDLED_JAVA_MIN) {
+    return { javaPath: bundledJava, major: BUNDLED_JAVA_MAJOR };
+  }
 
-  const component = String(jv.component || 'java-runtime-epsilon');
+  // старым версиям (до 1.17 — Java 8, 1.17 — Java 16) вшитая не подходит:
+  // Forge и многие моды под них на Java 21 не стартуют
+  const component = String(jv.component
+    || (major > BUNDLED_JAVA_MAJOR ? 'java-runtime-epsilon' : major >= 16 ? 'java-runtime-alpha' : 'jre-legacy'));
   const ready = installedRuntime(component);
   if (ready) return { javaPath: ready, major };
 
@@ -200,7 +281,7 @@ async function ensureJava({ versionJson, bundledJava, installer, dl, runTask }) 
   const target = plat && index[plat] && index[plat][component] && index[plat][component][0];
   if (!target) {
     throw new Error('Для этой системы нет Java ' + major + ' — Minecraft ' + ((versionJson && versionJson.id) || '')
-      + ' на ней не запустится. Выберите версию 1.21.11.');
+      + ' на ней не запустится. Выберите другую версию игры.');
   }
   const manifest = await fetchJsonAny(withMirror(target.manifest.url), dl.dispatcher);
   if (!manifest || !manifest.files) throw new Error('Mojang отдал пустой список файлов Java');
@@ -327,11 +408,17 @@ module.exports = {
   BUNDLED_JAVA_MAJOR,
   init,
   gameVersions,
+  allReleases,
+  releaseSupported,
   isKnown,
   javaMajorGuess,
   unsupportedReason,
   forgeVersion,
   forgeVersionCached,
+  neoforgeVersion,
+  neoforgeProject,
+  neoforgeFullVersion,
+  quiltLoaderVersion,
   ensureJava,
   installedRuntime,
   protocolOf,

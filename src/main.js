@@ -25,6 +25,11 @@ const buildSecret = require('./build-secret');
 const filelog = require('./filelog');
 const friendsync = require('./friendsync');
 const remotemods = require('./remotemods');
+const profiles = require('./profiles');
+const prism = require('./prism');
+// Сборка, выбранная в ЭТОМ окне (у соседних окон мультиаккаунта может быть
+// своя); при старте — последняя выбранная (lastProfile), см. initActiveProfile.
+let activeProfileId = null;
 
 // Файловый лог — раньше всего остального: падения на старте должны попасть
 // в журнал, даже если окно так и не открылось.
@@ -136,10 +141,20 @@ versions.init({ dataDir: app.getPath('userData'), log: (t) => logLine(t) });
 // Выбранная версия игры. Значение из конфига сверяем со списком: версия могла
 // пропасть из него (конфиг перенесли с 64-битной сборки на 32-битную, где 26.x
 // не запускаются) — тогда играем на версии сервера.
+// У своих сборок список шире — любые релизы (как в Prism).
 function currentMc(cfg) {
-  const want = (cfg || loadConfig()).mcVersion;
+  cfg = cfg || loadConfig();
+  const want = cfg.mcVersion;
+  if (cfg.profileId && cfg.profileId !== profiles.MAIN_ID) {
+    return versions.releaseSupported(want) ? want : MC_VERSION;
+  }
   const v = versions.gameVersions().find((x) => x.id === want);
   return v && v.supported ? v.id : MC_VERSION;
+}
+/** Версии, которые можно выбрать в текущей сборке. */
+function versionChoices(cfg, manifest) {
+  return cfg.profileId && cfg.profileId !== profiles.MAIN_ID
+    ? versions.allReleases(manifest) : versions.gameVersions(manifest);
 }
 // Что показать в подвале окна для версии игры: Fabric от неё не зависит,
 // Forge под каждую свой (null — под эту версию Forge ещё не вышел)
@@ -442,6 +457,19 @@ function modsResourceDir() {
   }
   return remotemods.dir();
 }
+// Моды Mist MC (вшитые) в выбранной сборке: в главной всегда, в своей — пока
+// не выключены в её настройках
+function mistModsOn(cfg) {
+  const p = profiles.find(cfg, cfg.profileId);
+  return !p || p.mistMods !== false;
+}
+function bundledDirOf(cfg) { return mistModsOn(cfg) ? modsResourceDir() : null; }
+/** Привести папку модов сборки к её версии и загрузчику (вшитые + свои). */
+function syncModsOf(cfg, log, mc) {
+  mods.syncMods(cfg.gameDir || defaultGameDir(), cfg.loader || 'fabric', modsResourceDir(), log,
+    mc || currentMc(cfg), { noBundled: !mistModsOn(cfg) });
+}
+
 /**
  * Сверка модов сборки в фоне: набор на сайте поменялся — папка игры
  * пересобирается (если игра не идёт: папка общая, тогда — при запуске) и
@@ -450,12 +478,12 @@ function modsResourceDir() {
 function refreshBundledInBackground() {
   refreshBundledMods((s) => filelog.line(s)).then((changed) => {
     if (!changed) return;
-    if (!gameRunning() && !otherRunningGames().length) {
+    if (!gameRunning()) {
       try {
         const cfg1 = loadConfig();
         const dir1 = cfg1.gameDir || defaultGameDir();
-        if (fs.existsSync(dir1)) {
-          mods.syncMods(dir1, cfg1.loader || 'fabric', modsResourceDir(), (s) => filelog.line(s), currentMc(cfg1));
+        if (fs.existsSync(dir1) && !otherRunningGames(dir1).length) {
+          syncModsOf(cfg1, (s) => filelog.line(s));
         }
       } catch (e) {
         filelog.line('моды после обновления сборки не пересобрались: ' + (e && e.message));
@@ -530,12 +558,25 @@ function loadConfig() {
         : null; // не расшифровался → просим войти заново
     }
     cfg.accounts = readAccounts(cfg);
-    return cfg;
+    return profiles.overlay(cfg, activeProfileId);
   } catch (_) {
     defaults.accounts = [];
-    return defaults;
+    return profiles.overlay(defaults, profiles.MAIN_ID);
   }
 }
+function initActiveProfile() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    activeProfileId = profiles.find(raw, raw.lastProfile) ? raw.lastProfile : profiles.MAIN_ID;
+  } catch (_) {
+    activeProfileId = profiles.MAIN_ID;
+  }
+}
+initActiveProfile();
+function activeProfile(cfg) {
+  return profiles.find(cfg || loadConfig(), activeProfileId);
+}
+function isMainProfile() { return !activeProfileId || activeProfileId === profiles.MAIN_ID; }
 // Список аккаунтов в рабочем виде: { type:'offline', name } либо
 // { type:'msa', name, uuid, refreshToken }. Конфиг до мультиаккаунта хранил
 // один аккаунт в accountType/offlineName/msAccount — из него список и собирается.
@@ -564,7 +605,8 @@ function saveConfig(cfg) {
   try {
     fs.mkdirSync(path.dirname(configPath()), { recursive: true });
     // На диск — копия без плейнтекст-токена: заменяем refreshToken на refreshTokenEnc.
-    const toWrite = Object.assign({}, cfg);
+    // Поля выбранной сборки уходят в её запись, верх конфига — главной сборке.
+    const toWrite = profiles.strip(cfg);
     if (cfg.msAccount && cfg.msAccount.refreshToken) {
       const enc = encryptSecret(cfg.msAccount.refreshToken);
       toWrite.msAccount = enc
@@ -961,8 +1003,8 @@ app.whenReady().then(() => {
   try {
     const cfg0 = loadConfig();
     const dir0 = cfg0.gameDir || defaultGameDir();
-    if (fs.existsSync(dir0) && !otherRunningGames().length) {
-      mods.syncMods(dir0, cfg0.loader || 'fabric', modsResourceDir(), (s) => filelog.line(s), currentMc(cfg0));
+    if (fs.existsSync(dir0) && !otherRunningGames(dir0).length) {
+      syncModsOf(cfg0, (s) => filelog.line(s));
     }
   } catch (e) {
     filelog.line('моды при старте не пересобрались: ' + (e && e.message));
@@ -1222,7 +1264,8 @@ ipcMain.handle('get-config', () => {
     versionInfo: { ...versionInfoFor(mc), launcher: app.getVersion() },
     // список версий игры — из сохранённого манифеста, без ожидания сети;
     // свежий окно дозапросит само (game-versions)
-    gameVersions: versions.gameVersions(),
+    gameVersions: versionChoices(config),
+    profiles: profilesPayload(config),
     ...accountsPayload(config),
     bgMedia: bgMedia(config.theme && config.theme.bgImage),
     arch: process.arch, // ia32-сборке renderer урезает ползунок памяти
@@ -1233,12 +1276,19 @@ ipcMain.handle('get-config', () => {
 ipcMain.handle('save-config', (_e, patch) => {
   const cfg = loadConfig();
   const rpcWas = cfg.discordRpc !== false;
-  for (const k of ['ram', 'loader', 'joinServer', 'gameDir', 'discordRpc', 'theme']) {
+  const main = isMainProfile();
+  for (const k of ['ram', 'joinServer', 'discordRpc', 'theme']) {
     if (patch && k in patch) cfg[k] = patch[k];
+  }
+  // папка своей сборки — её собственная, «Обзором» меняется только у главной
+  if (patch && main && typeof patch.gameDir === 'string') cfg.gameDir = patch.gameDir;
+  // у главной — загрузчики сборки Mist MC, у своих — все (как в Prism)
+  if (patch && (main ? ['fabric', 'forge', 'vanilla'] : profiles.LOADERS).includes(patch.loader)) {
+    cfg.loader = patch.loader;
   }
   // версию игры принимаем только из списка и только ту, что здесь запустится
   if (patch && typeof patch.mcVersion === 'string') {
-    const v = versions.gameVersions().find((x) => x.id === patch.mcVersion);
+    const v = versionChoices(cfg).find((x) => x.id === patch.mcVersion);
     if (v && v.supported) cfg.mcVersion = v.id;
   }
   saveConfig(cfg);
@@ -1261,11 +1311,19 @@ ipcMain.handle('game-versions', async () => {
   let manifest = null;
   try { manifest = await fetchVersionList(dl.dispatcher); } catch (_) { /* останемся на сохранённом */ }
   await versions.forgeVersion('', dl.dispatcher).catch(() => null); // освежает сохранённый список Forge
-  const mc = currentMc();
+  const cfg = loadConfig();
+  const mc = currentMc(cfg);
   return {
-    gameVersions: versions.gameVersions(manifest).map((v) => ({ ...v, forge: versionInfoFor(v.id).forge })),
+    gameVersions: versionChoices(cfg, manifest).map((v) => ({ ...v, forge: versionInfoFor(v.id).forge })),
     versionInfo: { ...versionInfoFor(mc), launcher: app.getVersion() },
   };
+});
+
+// Все релизы Minecraft — для новой своей сборки (как список версий в Prism)
+ipcMain.handle('all-versions', async () => {
+  let manifest = null;
+  try { manifest = await fetchVersionList(makeDownloadOptions().dispatcher); } catch (_) { /* сохранённый */ }
+  return versions.allReleases(manifest);
 });
 
 // Смена версии игры: в папке mods сразу остаются только моды под неё (как и
@@ -1273,18 +1331,18 @@ ipcMain.handle('game-versions', async () => {
 // джарниками прежней версии и резолвер видел бы чужой набор.
 ipcMain.handle('set-game-version', (_e, id) => {
   const cfg = loadConfig();
-  const v = versions.gameVersions().find((x) => x.id === id);
+  const v = versionChoices(cfg).find((x) => x.id === id);
   if (!v) return { ok: false, error: 'Такой версии нет в списке' };
   if (!v.supported) return { ok: false, error: v.reason };
   if (windowBusy()) return { ok: false, error: 'Сначала закройте игру — версию меняют между запусками' };
-  if (otherRunningGames().length) {
-    return { ok: false, error: 'В другом окне лаунчера идёт игра — папка модов общая, версию можно сменить после её закрытия' };
+  if (otherRunningGames(cfg.gameDir).length) {
+    return { ok: false, error: 'В другом окне лаунчера идёт игра в этой сборке — версию можно сменить после её закрытия' };
   }
   cfg.mcVersion = v.id;
   saveConfig(cfg);
   const notes = [];
   try {
-    mods.syncMods(currentGameDir(), cfg.loader || 'fabric', modsResourceDir(), (s) => filelog.line(s), v.id);
+    syncModsOf(cfg, (s) => filelog.line(s), v.id);
   } catch (e) {
     notes.push('моды не пересобрались: ' + e.message);
   }
@@ -1319,12 +1377,323 @@ ipcMain.handle('pick-dir', async () => {
   return res.filePaths[0];
 });
 
-// Открыть папку игры в проводнике (создаём, если до первого запуска её ещё нет)
-ipcMain.handle('open-game-dir', async () => {
-  const dir = currentGameDir();
+// Открыть папку игры в проводнике (создаём, если до первого запуска её ещё нет).
+// sub — подпапка, как кнопки «Папка» в Prism: mods, resourcepacks, saves…
+const OPEN_SUBDIRS = new Set(['mods', 'resourcepacks', 'shaderpacks', 'saves', 'screenshots', 'config', 'logs']);
+ipcMain.handle('open-game-dir', async (_e, sub) => {
+  let dir = currentGameDir();
+  if (OPEN_SUBDIRS.has(sub)) dir = path.join(dir, sub);
   try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* покажет openPath */ }
   const err = await shell.openPath(dir);
   return { ok: !err, error: err || undefined };
+});
+
+// ── Сборки (как инстансы в Prism) ──
+function profilesRoot(cfg) {
+  return path.join(cfg.resourceDir || cfg.gameDir || defaultGameDir(), 'instances');
+}
+function iconData(file) {
+  try {
+    const buf = fs.readFileSync(file);
+    if (buf.length > 512 * 1024) return null;
+    const mime = sniffImageMime(buf);
+    return mime ? 'data:' + mime + ';base64,' + buf.toString('base64') : null;
+  } catch (_) { return null; }
+}
+function modCount(dir) {
+  try { return fs.readdirSync(path.join(dir, 'mods')).filter((n) => /\.jar$/i.test(n)).length; } catch (_) { return 0; }
+}
+function profilesPayload(cfg) {
+  const main = cfg.mainFields || cfg;
+  const runningHere = gameRunning() && lastLaunch ? lastLaunch.gameDir : null;
+  const running = (dir) => (runningHere && sameDir(runningHere, dir)) || otherRunningGames(dir).length > 0;
+  const list = [{
+    id: profiles.MAIN_ID,
+    main: true,
+    name: 'Mist MC',
+    icon: 'mist',
+    mcVersion: main.mcVersion || MC_VERSION,
+    loader: main.loader || 'fabric',
+    ram: main.ram,
+    playTime: Number(cfg.mainPlayTime) || 0,
+    lastPlayed: cfg.mainLastPlayed || null,
+    mods: modCount(main.gameDir || defaultGameDir()),
+    running: running(main.gameDir || defaultGameDir()),
+  }];
+  for (const p of profiles.listOf(cfg)) {
+    list.push({
+      id: p.id,
+      main: false,
+      name: p.name,
+      icon: p.icon,
+      iconUrl: p.iconFile ? iconData(path.join(p.dir, p.iconFile)) : null,
+      group: p.group || null,
+      mcVersion: p.mcVersion,
+      loader: p.loader,
+      loaderVersion: p.loaderVersion || null,
+      ram: p.ram,
+      joinServer: !!p.joinServer,
+      mistMods: p.mistMods !== false,
+      playTime: Number(p.playTime) || 0,
+      lastPlayed: p.lastPlayed || null,
+      source: p.source ? p.source.kind : null,
+      dir: p.dir,
+      mods: modCount(p.dir),
+      running: running(p.dir),
+      missing: !fs.existsSync(p.dir),
+    });
+  }
+  return { active: cfg.profileId || profiles.MAIN_ID, list, icons: profiles.ICONS, loaders: profiles.LOADERS };
+}
+
+ipcMain.handle('profiles-list', () => profilesPayload(loadConfig()));
+
+ipcMain.handle('profile-select', (_e, id) => {
+  if (windowBusy()) return { ok: false, error: 'Сначала закройте игру — сборку меняют между запусками' };
+  const cfg = loadConfig();
+  if (id !== profiles.MAIN_ID && !profiles.find(cfg, id)) return { ok: false, error: 'Такой сборки нет' };
+  activeProfileId = id;
+  const fresh = loadConfig();
+  fresh.lastProfile = id;
+  saveConfig(fresh);
+  try {
+    if (fs.existsSync(fresh.gameDir) && !otherRunningGames(fresh.gameDir).length) {
+      syncModsOf(fresh, (s) => filelog.line(s));
+    }
+  } catch (e) { filelog.line('моды сборки не пересобрались: ' + (e && e.message)); }
+  return { ok: true };
+});
+
+function checkProfileOpts(o, cfg) {
+  if (!o || typeof o !== 'object') return 'Нет данных сборки';
+  if (typeof o.name !== 'string' || !o.name.trim()) return 'Введите название сборки';
+  if (o.mcVersion !== undefined) {
+    const v = versions.allReleases().find((x) => x.id === o.mcVersion);
+    if (!v) return 'Такой версии Minecraft нет в списке';
+    if (!v.supported) return v.reason;
+  }
+  if (o.loader !== undefined && !profiles.LOADERS.includes(o.loader)) return 'Неизвестный загрузчик';
+  return null;
+}
+
+ipcMain.handle('profile-create', (_e, o) => {
+  const cfg = loadConfig();
+  const err = checkProfileOpts(o, cfg);
+  if (err) return { ok: false, error: err };
+  try {
+    const p = profiles.create(cfg, profilesRoot(cfg), {
+      name: o.name, icon: o.icon, mcVersion: o.mcVersion || MC_VERSION, loader: o.loader || 'fabric',
+      ram: o.ram || (cfg.mainFields || cfg).ram, joinServer: !!o.joinServer, mistMods: o.mistMods !== false,
+      source: { kind: 'new' },
+    });
+    saveConfig(cfg);
+    return { ok: true, id: p.id };
+  } catch (e) {
+    return { ok: false, error: 'Не удалось создать сборку: ' + e.message };
+  }
+});
+
+ipcMain.handle('profile-update', (_e, id, patch) => {
+  const cfg = loadConfig();
+  const p = profiles.find(cfg, id);
+  if (!p) return { ok: false, error: 'Такой сборки нет' };
+  const err = checkProfileOpts({ name: patch.name || p.name, mcVersion: patch.mcVersion, loader: patch.loader }, cfg);
+  if (err) return { ok: false, error: err };
+  const gameChange = (patch.mcVersion && patch.mcVersion !== p.mcVersion) || (patch.loader && patch.loader !== p.loader)
+    || ('mistMods' in patch && !!patch.mistMods !== (p.mistMods !== false));
+  if (gameChange && ((id === activeProfileId && windowBusy()) || otherRunningGames(p.dir).length)) {
+    return { ok: false, error: 'В этой сборке идёт игра — версию и загрузчик меняют после её закрытия' };
+  }
+  profiles.update(cfg, id, patch);
+  // у выбранной сборки наложенные поля главнее записи — переносим правку и в них
+  if (cfg.profileId === id) {
+    if (patch.mcVersion) cfg.mcVersion = p.mcVersion;
+    if (patch.loader) cfg.loader = p.loader;
+    if (patch.ram) cfg.ram = p.ram;
+    if ('joinServer' in patch) cfg.joinServer = p.joinServer;
+  }
+  saveConfig(cfg);
+  if (gameChange && cfg.profileId === id) {
+    try { syncModsOf(loadConfig(), (s) => filelog.line(s)); } catch (_) { /* пересоберётся при запуске */ }
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('profile-duplicate', async (_e, id) => {
+  const cfg = loadConfig();
+  const p = profiles.find(cfg, id);
+  if (!p) return { ok: false, error: 'Копировать можно только свою сборку' };
+  try {
+    const copy = profiles.create(cfg, profilesRoot(cfg), {
+      name: p.name + ' (копия)', icon: p.icon, group: p.group, mcVersion: p.mcVersion, loader: p.loader,
+      loaderVersion: p.loaderVersion, ram: p.ram, joinServer: p.joinServer, mistMods: p.mistMods,
+      source: { kind: 'copy' },
+    });
+    await fs.promises.cp(p.dir, copy.dir, {
+      recursive: true,
+      filter: (src) => !/[\\/](logs|crash-reports|\.cache)$/i.test(src),
+    });
+    if (p.iconFile) copy.iconFile = p.iconFile;
+    saveConfig(cfg);
+    return { ok: true, id: copy.id };
+  } catch (e) {
+    return { ok: false, error: 'Не удалось скопировать: ' + e.message };
+  }
+});
+
+// Удаление: из списка всегда; папку — только в корзину (вернуть можно), и
+// только если она внутри нашей папки сборок — чужие папки не трогаем.
+ipcMain.handle('profile-delete', async (_e, id, withFiles) => {
+  const cfg = loadConfig();
+  const p = profiles.find(cfg, id);
+  if (!p) return { ok: false, error: 'Главную сборку удалить нельзя' };
+  if ((id === activeProfileId && windowBusy()) || otherRunningGames(p.dir).length) {
+    return { ok: false, error: 'В этой сборке идёт игра — сначала закройте её' };
+  }
+  let trashed = false;
+  if (withFiles && fs.existsSync(p.dir)) {
+    const root = path.resolve(profilesRoot(cfg)).toLowerCase() + path.sep;
+    if (!(path.resolve(p.dir).toLowerCase() + path.sep).startsWith(root)) {
+      return { ok: false, error: 'Папка сборки лежит не в папке лаунчера — удалите её вручную: ' + p.dir };
+    }
+    try {
+      await shell.trashItem(p.dir);
+      trashed = true;
+    } catch (e) {
+      return { ok: false, error: 'Не удалось убрать папку в корзину: ' + e.message };
+    }
+  }
+  profiles.remove(cfg, id);
+  if (activeProfileId === id) {
+    activeProfileId = profiles.MAIN_ID;
+    cfg.lastProfile = profiles.MAIN_ID;
+  }
+  saveConfig(cfg);
+  return { ok: true, trashed };
+});
+
+// ── Перенос из Prism Launcher ──
+ipcMain.handle('prism-scan', () => {
+  // MISTMC_PRISM_ROOT — только из исходников: подсунуть тестовую установку Prism
+  const extra = !app.isPackaged && process.env.MISTMC_PRISM_ROOT ? process.env.MISTMC_PRISM_ROOT : undefined;
+  try { return { ok: true, roots: prism.scan(extra) }; } catch (e) { return { ok: false, error: e.message, roots: [] }; }
+});
+ipcMain.handle('prism-pick', async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: 'Папка Prism Launcher (где лежат instances и prismlauncher.cfg)',
+    properties: ['openDirectory'],
+  });
+  if (res.canceled || !res.filePaths.length) return null;
+  const dir = res.filePaths[0];
+  // выбрали саму папку instances или один инстанс — поднимаемся до установки
+  const cands = [dir, path.dirname(dir), path.dirname(path.dirname(dir))];
+  const root = cands.find((d) => prism.isRoot(d));
+  if (!root) return { ok: false, error: 'Это не похоже на папку Prism Launcher — в ней нет instances и prismlauncher.cfg' };
+  return { ok: true, root: prism.describeRoot(root, 'Папка: ' + root) };
+});
+
+let importing = false;
+ipcMain.handle('prism-import', async (_e, { root, ids, accounts } = {}) => {
+  if (importing) return { ok: false, error: 'Перенос уже идёт' };
+  if (typeof root !== 'string' || !prism.isRoot(root)) return { ok: false, error: 'Папка Prism не найдена' };
+  const all = prism.readInstances(root);
+  const chosen = all.filter((i) => Array.isArray(ids) && ids.includes(i.id));
+  if (!chosen.length && !accounts) return { ok: false, error: 'Ничего не выбрано' };
+  importing = true;
+  const report = [];
+  let firstId = null;
+  try {
+    for (let n = 0; n < chosen.length; n++) {
+      const inst = chosen[n];
+      const head = '«' + inst.name + '» (' + (n + 1) + ' из ' + chosen.length + ')';
+      send('import-progress', { title: head, done: 0, total: 1 });
+      logLine('▶ Перенос из Prism: ' + inst.name + ' — Minecraft ' + inst.mc + ', ' + inst.loader);
+      const cfg = loadConfig();
+      const supported = versions.allReleases().find((x) => x.id === inst.mc);
+      const p = profiles.create(cfg, profilesRoot(cfg), {
+        name: inst.name,
+        icon: inst.icon || undefined,
+        group: inst.group,
+        mcVersion: inst.mc,
+        loader: inst.loader,
+        loaderVersion: inst.loaderVersion,
+        ram: inst.ram || (cfg.mainFields || cfg).ram,
+        joinServer: inst.joinMist,
+        // свои моды Mist (плащи, друзья) в чужую сборку сами не подкладываем —
+        // включаются в настройках сборки
+        mistMods: false,
+        source: { kind: 'prism', from: inst.dir },
+        playTime: inst.playTimeMs,
+        lastPlayed: inst.lastPlayed || undefined,
+      });
+      saveConfig(cfg);
+      firstId = firstId || p.id;
+      const res = await prism.copyInstance(inst, p.dir, {
+        checkMod: (file) => mods.blockedJar(file, mods.jarModInfo(file)),
+        onProgress: (pr) => send('import-progress', { title: head, ...pr }),
+      });
+      if (inst.iconFile) {
+        try {
+          const name = 'icon' + path.extname(inst.iconFile).toLowerCase();
+          fs.copyFileSync(inst.iconFile, path.join(p.dir, name));
+          const c2 = loadConfig();
+          const p2 = profiles.find(c2, p.id);
+          if (p2) { p2.iconFile = name; saveConfig(c2); }
+        } catch (_) { /* останется стандартный значок */ }
+      }
+      send('import-progress', { title: head + ' — составляю список модов', done: 1, total: 1 });
+      let adopted = 0;
+      for (const type of ['mod', 'resourcepack', 'shader']) {
+        try { adopted += await mods.adoptContent(p.dir, type, inst.loader, inst.mc, null, logLine); } catch (_) { /* список дособерётся во вкладке «Моды» */ }
+      }
+      const notes = [];
+      if (!supported) notes.push('Minecraft ' + inst.mc + ' нет в списке версий — выберите версию в настройках сборки');
+      else if (!supported.supported) notes.push(supported.reason);
+      if (inst.extras.length) notes.push('OptiFine/LiteLoader лаунчер не ставит — сборка запустится без них');
+      if (res.failed.length) notes.push('не скопировалось файлов: ' + res.failed.length);
+      report.push({
+        name: p.name,
+        id: p.id,
+        mods: res.mods,
+        files: res.copied,
+        blocked: [...new Set(res.blocked)],
+        notes,
+      });
+      logLine('  ✓ скопировано файлов ' + res.copied + ', модов ' + res.mods + (res.blocked.length
+        ? ', не перенесены (запрещены на Mist MC): ' + [...new Set(res.blocked)].join(', ') : ''));
+    }
+    // офлайн-ники из Prism — в наш список аккаунтов
+    const addedNicks = [];
+    if (accounts) {
+      const cfg = loadConfig();
+      for (const a of prism.readAccounts(root)) {
+        if (a.type !== 'offline' || !NICK_RE.test(a.name)) continue;
+        const acc = { type: 'offline', name: a.name };
+        if (cfg.accounts.some((x) => accountKey(x) === accountKey(acc))) continue;
+        cfg.accounts.push(acc);
+        addedNicks.push(a.name);
+      }
+      if (addedNicks.length) saveConfig(cfg);
+      // нет активного аккаунта — первый перенесённый ник сразу в дело
+      if (addedNicks.length && !activeAccount()) {
+        activateAccount(loadConfig(), loadConfig().accounts.find((x) => x.type === 'offline' && x.name === addedNicks[0]));
+      }
+    }
+    // перенесённую сборку сразу выбираем (если окно не занято игрой)
+    if (firstId && !windowBusy()) {
+      activeProfileId = firstId;
+      const c3 = loadConfig();
+      c3.lastProfile = firstId;
+      saveConfig(c3);
+    }
+    return { ok: true, report, addedNicks, ...accountsPayload(loadConfig()) };
+  } catch (e) {
+    logLine('✖ Перенос из Prism: ' + e.message);
+    return { ok: false, error: e.message, report };
+  } finally {
+    importing = false;
+    send('import-progress', null);
+  }
 });
 
 // ── Перенос настроек из другого лаунчера ──
@@ -1480,21 +1849,26 @@ function currentGameDir() {
 // Версия игры, с которой работает окно: оно присылает свою (у соседнего окна
 // мультиаккаунта выбор мог уйти вперёд), а мы сверяем её со списком.
 function mcOf(arg) {
-  const v = arg && typeof arg.mc === 'string' && versions.gameVersions().find((x) => x.id === arg.mc);
+  const v = arg && typeof arg.mc === 'string' && versionChoices(loadConfig()).find((x) => x.id === arg.mc);
   return v && v.supported ? v.id : currentMc();
 }
 
 // Игры, запущенные другими окнами лаунчера: pid → версия. Папка модов у окон
 // общая, поэтому две разные версии игры одновременно в ней не уживутся.
 const GAMES_DIR = path.join(app.getPath('userData'), 'games');
-function markGameRunning(mc) {
+// В файле — JSON { mc, dir }: у сборок папки разные, и мешают друг другу только
+// игры в одной папке. Старые лаунчеры писали голую версию — папка неизвестна,
+// считаем, что общая.
+function markGameRunning(mc, dir) {
   try {
     fs.mkdirSync(GAMES_DIR, { recursive: true });
     const file = path.join(GAMES_DIR, String(process.pid));
-    if (mc) fs.writeFileSync(file, mc); else fs.unlinkSync(file);
+    if (mc) fs.writeFileSync(file, JSON.stringify({ mc, dir: dir || null })); else fs.unlinkSync(file);
   } catch (_) {}
 }
-function otherRunningGames() {
+function sameDir(a, b) { return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase(); }
+/** Версии игр, идущих в других окнах; с dir — только тех, что в этой папке. */
+function otherRunningGames(dir) {
   const out = [];
   let files = [];
   try { files = fs.readdirSync(GAMES_DIR); } catch (_) { return out; }
@@ -1504,7 +1878,11 @@ function otherRunningGames() {
     const file = path.join(GAMES_DIR, f);
     try {
       process.kill(pid, 0); // жив ли процесс; сигнал не шлётся
-      out.push(fs.readFileSync(file, 'utf8').trim());
+      const raw = fs.readFileSync(file, 'utf8').trim();
+      let rec;
+      try { rec = JSON.parse(raw); } catch (_) { rec = { mc: raw, dir: null }; }
+      if (dir && rec.dir && !sameDir(rec.dir, dir)) continue;
+      out.push(rec.mc);
     } catch (_) {
       try { fs.unlinkSync(file); } catch (_e) {}
     }
@@ -1542,6 +1920,16 @@ function rememberJoinSupport(mc, ok) {
   } catch (_) {}
 }
 
+let adoptBusy = false;
+function adoptInBackground(cfg, type, loader, mc) {
+  if (adoptBusy || isMainProfile()) return;
+  adoptBusy = true;
+  mods.adoptContent(cfg.gameDir, type, loader, mc, bundledDirOf(cfg), (s) => filelog.line(s))
+    .then((n) => { if (n) send('mods-changed'); })
+    .catch(() => {})
+    .finally(() => { adoptBusy = false; });
+}
+
 ipcMain.handle('mods-list', (_e, arg) => {
   // открыли список модов — заодно свериться с сайтом (не чаще раза в 2 минуты)
   refreshBundledInBackground();
@@ -1549,13 +1937,15 @@ ipcMain.handle('mods-list', (_e, arg) => {
   const mc = mcOf(arg);
   try {
     const dir = currentGameDir();
-    const list = mods.listContent(dir, type, loader, modsResourceDir(), mc);
+    const cfgM = loadConfig();
+    adoptInBackground(cfgM, type, loader, mc);
+    const list = mods.listContent(dir, type, loader, bundledDirOf(cfgM), mc);
     if (type !== 'mod') return { ok: true, ...list };
     // подсказки к списку: что не запустится и чего под эту версию игры ещё нет
     return {
       ok: true,
       ...list,
-      issues: mods.diagnose(dir, loader, mc, modsResourceDir()),
+      issues: mods.diagnose(dir, loader, mc, bundledDirOf(cfgM)),
       migrate: mods.migrateCandidates(dir, loader, mc),
     };
   } catch (e) {
@@ -1905,13 +2295,13 @@ const friendHandlers = {
     // закрытия игрок остался бы без игры и без объяснения.
     let switchTo = null;
     if (mc && mc !== lastLaunch.mcVersion) {
-      const v = versions.gameVersions().find((x) => x.id === mc);
+      const v = versionChoices(loadConfig()).find((x) => x.id === mc);
       if (!v) throw new Error('В лаунчере нет Minecraft ' + mc + '.');
       if (!v.supported) throw new Error(v.reason);
       if (lastLaunch.loader !== 'fabric' || !mods.hasBundled(modsResourceDir(), mc)) {
         throw new Error('Под Minecraft ' + mc + ' нет мода друзей Mist MC.');
       }
-      if (otherRunningGames().some((x) => x && x !== mc)) {
+      if (otherRunningGames(lastLaunch.gameDir).some((x) => x && x !== mc)) {
         throw new Error('В другом окне лаунчера идёт игра — версию можно сменить после её закрытия.');
       }
       switchTo = mc;
@@ -1922,6 +2312,45 @@ const friendHandlers = {
 };
 
 ipcMain.handle('launch-game', (_e, opts) => launchGame(opts));
+
+const LOADER_TITLES = { fabric: 'Fabric', forge: 'Forge', neoforge: 'NeoForge', quilt: 'Quilt', vanilla: 'Vanilla' };
+
+function versionJsonExists(resourceDir, id) {
+  return !!id && fs.existsSync(path.join(resourceDir, 'versions', id, id + '.json'));
+}
+// Установленный профиль загрузчика запоминаем в сборке: установщик NeoForge
+// гоняет свои процессоры минуту-другую, повторять это на каждом запуске незачем.
+function rememberLoaderProfile(prof, key, id) {
+  if (!prof) return;
+  try {
+    const c = loadConfig();
+    const p = profiles.find(c, prof.id);
+    if (p) { p.loaderInstalled = { key, id }; saveConfig(c); }
+  } catch (_) { /* не запомнили — поставится заново */ }
+}
+async function installNeoForgeProfile(prof, mcVersion, mc, resourceDir, dl, javaPath) {
+  const want = (prof && prof.loaderVersion) || await versions.neoforgeVersion(mcVersion, dl.dispatcher);
+  const full = versions.neoforgeFullVersion(mcVersion, want);
+  if (!full) {
+    throw new Error('NeoForge под Minecraft ' + mcVersion + ' не найден — выберите другой загрузчик или версию игры');
+  }
+  const key = 'neoforge:' + mcVersion + ':' + full;
+  const done = prof && prof.loaderInstalled;
+  if (done && done.key === key && versionJsonExists(resourceDir, done.id)) return done.id;
+  const id = await runTask('Установка NeoForge ' + full + ' (может занять пару минут)',
+    installer.installNeoForgedTask(versions.neoforgeProject(mcVersion), full, mc, { ...dl, java: javaPath }));
+  rememberLoaderProfile(prof, key, id);
+  return id;
+}
+async function installQuiltProfile(prof, mcVersion, mc, resourceDir, dl) {
+  const want = (prof && prof.loaderVersion) || await versions.quiltLoaderVersion(dl.dispatcher);
+  if (!want) throw new Error('Не удалось узнать версию Quilt Loader — проверьте интернет');
+  const id = mcVersion + '-quilt' + want;
+  if (versionJsonExists(resourceDir, id)) return id; // профиль уже лежит — без сети
+  status('Установка Quilt ' + want);
+  logLine('▶ Установка Quilt ' + want);
+  return installer.installQuiltVersion({ minecraftVersion: mcVersion, version: want, minecraft: mc, dispatcher: dl.dispatcher });
+}
 
 // opts — то же, что присылает окно; friendJoin — ник друга, в чей мир игра
 // зайдёт сама (перезапуск после установки его модов)
@@ -1946,26 +2375,37 @@ async function launchGame(opts) {
     return { ok: true };
   }
   if (launching) return { ok: false, error: 'Уже идёт запуск' };
-  const loader = opts.loader || 'fabric';
+  // Всё о сборке берём из конфига этого окна (выбранная сборка наложена на
+  // него), а не из присланного: окно знает только то, что ему показали.
+  const cfgL = loadConfig();
+  const prof = activeProfile(cfgL); // null — главная сборка Mist MC
+  const loaderOk = prof ? profiles.LOADERS : ['fabric', 'forge', 'vanilla'];
+  const loader = loaderOk.includes(opts.loader) ? opts.loader : (cfgL.loader || 'fabric');
+  const mistOn = mistModsOn(cfgL);
   // 32-битный процесс адресует ~2 ГБ на всё: больше ~1 ГБ кучи JVM не поднимет
   const ramCap = process.arch === 'ia32' ? 1024 : 32768;
   const ram = Math.max(process.arch === 'ia32' ? 512 : 1024, Math.min(ramCap, parseInt(opts.ram, 10) || 4096));
   const friendJoin = typeof opts.friendJoin === 'string' && NICK_RE.test(opts.friendJoin) ? opts.friendJoin : null;
   // идём к другу — на сервер сами не подключаемся
   const joinServer = !!opts.joinServer && !friendJoin;
-  const gameDir = opts.gameDir || defaultGameDir();
+  const gameDir = cfgL.gameDir || defaultGameDir();
+  // библиотеки, ассеты и версии игры у всех сборок общие (как в Prism) —
+  // лежат в папке главной; у сборки своё только её содержимое
+  const resourceDir = cfgL.resourceDir || gameDir;
   const mcVersion = mcOf({ mc: opts.mcVersion });
+  const profIdAtLaunch = cfgL.profileId;
 
   const active = activeAccount();
   if (!active) {
     return { ok: false, error: 'Сначала войдите в аккаунт' };
   }
-  // Папка модов у окон лаунчера общая: вторая игра на ДРУГОЙ версии переложила
-  // бы моды под себя прямо под работающей первой.
-  const otherMc = otherRunningGames().find((v) => v && v !== mcVersion);
+  // Папка модов у окон одной сборки общая: вторая игра на ДРУГОЙ версии
+  // переложила бы моды под себя прямо под работающей первой. Разные сборки
+  // друг другу не мешают.
+  const otherMc = otherRunningGames(gameDir).find((v) => v && v !== mcVersion);
   if (otherMc) {
-    return { ok: false, error: 'В другом окне идёт игра на Minecraft ' + otherMc
-      + ' — одновременно можно играть только на одной версии' };
+    return { ok: false, error: 'В другом окне в этой сборке идёт игра на Minecraft ' + otherMc
+      + ' — в одной сборке одновременно можно играть только на одной версии' };
   }
 
   launching = true;
@@ -2002,7 +2442,8 @@ async function launchGame(opts) {
     }
 
     fs.mkdirSync(gameDir, { recursive: true });
-    const mc = MinecraftFolder.from(gameDir);
+    fs.mkdirSync(resourceDir, { recursive: true });
+    const mc = MinecraftFolder.from(resourceDir);
     const bundledJava = bundledJavaPath();
     // вшитая Java нужна версии сервера; версии новее качают свою (ensureJava)
     if (versions.javaMajorGuess(mcVersion) <= versions.BUNDLED_JAVA_MAJOR && !fs.existsSync(bundledJava)) {
@@ -2035,7 +2476,7 @@ async function launchGame(opts) {
 
     // 1.5) Java под эту версию: до Java 21 хватает вшитой, 26.x нужна Java 25 —
     // она один раз скачивается у Mojang в папку настроек лаунчера
-    const vanilla = await Version.parse(gameDir, mcVersion);
+    const vanilla = await Version.parse(resourceDir, mcVersion);
     const { javaPath, major: javaMajor } = await versions.ensureJava({
       versionJson: vanilla, bundledJava, installer, dl, runTask,
     });
@@ -2049,11 +2490,12 @@ async function launchGame(opts) {
       status('Установка Fabric ' + fabricLoader);
       logLine('▶ Установка Fabric ' + fabricLoader);
       versionId = await installFabricProfile(mcVersion, fabricLoader, mc, dl.dispatcher);
-      const resolved = await Version.parse(gameDir, versionId);
+      const resolved = await Version.parse(resourceDir, versionId);
       await runTask('Загрузка библиотек Fabric', installer.installDependenciesTask(resolved, dl));
     } else if (loader === 'forge') {
-      const forgeVersion = mcVersion === MC_VERSION
-        ? FORGE_VERSION : await versions.forgeVersion(mcVersion, dl.dispatcher);
+      // у сборки из Prism — ровно её Forge
+      const forgeVersion = (prof && prof.loaderVersion) || (mcVersion === MC_VERSION
+        ? FORGE_VERSION : await versions.forgeVersion(mcVersion, dl.dispatcher));
       if (!forgeVersion) {
         throw new Error('Forge под Minecraft ' + mcVersion + ' ещё не вышел — выберите Fabric или другую версию игры');
       }
@@ -2061,13 +2503,21 @@ async function launchGame(opts) {
         'Установка Forge ' + forgeVersion + ' (может занять пару минут)',
         installer.installForgeTask({ mcversion: mcVersion, version: forgeVersion }, mc, { ...dl, java: javaPath })
       );
-      const resolved = await Version.parse(gameDir, versionId);
+      const resolved = await Version.parse(resourceDir, versionId);
       await runTask('Загрузка библиотек Forge', installer.installDependenciesTask(resolved, dl));
+    } else if (loader === 'neoforge') {
+      versionId = await installNeoForgeProfile(prof, mcVersion, mc, resourceDir, dl, javaPath);
+      const resolved = await Version.parse(resourceDir, versionId);
+      await runTask('Загрузка библиотек NeoForge', installer.installDependenciesTask(resolved, dl));
+    } else if (loader === 'quilt') {
+      versionId = await installQuiltProfile(prof, mcVersion, mc, resourceDir, dl);
+      const resolved = await Version.parse(resourceDir, versionId);
+      await runTask('Загрузка библиотек Quilt', installer.installDependenciesTask(resolved, dl));
     }
 
     // 3) Синхронизация модов под выбранные загрузчик и версию игры (вшитые +
     // установленные из лаунчера); перед ней — свежий набор модов сборки с сайта
-    if (loader === 'fabric') {
+    if (loader === 'fabric' && mistOn) {
       status('Проверка модов сборки…');
       await Promise.race([
         refreshBundledMods(logLine),
@@ -2075,7 +2525,7 @@ async function launchGame(opts) {
       ]);
     }
     status('Синхронизация модов…');
-    mods.syncMods(gameDir, loader, modsResourceDir(), logLine, mcVersion);
+    mods.syncMods(gameDir, loader, modsResourceDir(), logLine, mcVersion, { noBundled: !mistOn });
     // Требования модов друг к другу и к самой игре из fabric.mod.json (напр.
     // Replay Voice Chat требует Replay Mod ровно 2.6.25) — чиним ДО запуска;
     // сбой сети не мешает
@@ -2096,7 +2546,7 @@ async function launchGame(opts) {
 
     // Паки и плащи Mist MC собраны под версию сервера и работают через вшитые
     // моды — на другой версии игры они только сыпали бы ошибками в журнал.
-    const serverBuild = mcVersion === MC_VERSION;
+    const serverBuild = mcVersion === MC_VERSION && mistOn;
 
     // 3.5) Серверный ресурспак (петы) с автообновлением по sha1 — запасной
     // канал к раздаче пака сервером; сбои сети запуску не мешают
@@ -2116,7 +2566,7 @@ async function launchGame(opts) {
     // Если прямой сайт недоступен (RU IP заблокирован в стране игрока) —
     // направляем мод на зеркало, иначе плащи не загрузятся. Мод плащей вшит
     // и под версии новее серверной — конфиг нужен везде, где он есть.
-    if (serverBuild || mods.hasBundled(modsResourceDir(), mcVersion)) try {
+    if (mistOn && (serverBuild || mods.hasBundled(modsResourceDir(), mcVersion))) try {
       const capesCfg = path.join(gameDir, 'config', 'mistcapes.json');
       await site.getBase().catch(() => {});
       if (process.env.MISTMC_SITE_URL) {
@@ -2141,7 +2591,7 @@ async function launchGame(opts) {
     if (joinServer && !serverBuild) {
       let accepts = null;
       try {
-        const raw = mods.readZipEntry(path.join(gameDir, 'versions', mcVersion, mcVersion + '.jar'), 'version.json');
+        const raw = mods.readZipEntry(path.join(resourceDir, 'versions', mcVersion, mcVersion + '.jar'), 'version.json');
         accepts = await versions.serverAccepts(JOIN_HOST, raw && versions.protocolOf(raw));
       } catch (_) { /* не узнали — подключаемся как обычно */ }
       if (accepts !== null) rememberJoinSupport(mcVersion, accepts);
@@ -2159,7 +2609,7 @@ async function launchGame(opts) {
     status('Запуск игры…');
     // метка «через лаунчер» + инвентаризация модов/паков для админки
     sendLauncherHeartbeat(account.name,
-      mods.collectClientInventory(gameDir, modsResourceDir(), loader, mcVersion));
+      mods.collectClientInventory(gameDir, bundledDirOf(cfgL), loader, mcVersion));
     logLine('▶ Запуск версии ' + versionId + ' от имени ' + account.name
       + (account.userType === 'msa' ? ' (Microsoft)' : ' (по нику)'));
     const freeMb = Math.floor(os.freemem() / 1048576);
@@ -2169,8 +2619,10 @@ async function launchGame(opts) {
     const secondGameArgs = [];
     if (otherRunningGames().length) {
       // моды, чьё хранилище держит первая игра, этой не грузим — иначе она
-      // упадёт при входе на сервер и зависнет на «Сохранении мира»
-      const off = loader === 'fabric' ? mods.secondGameDisabledMods(gameDir) : { ids: [] };
+      // упадёт при входе на сервер и зависнет на «Сохранении мира» (только
+      // если первая игра в той же папке: у другой сборки хранилище своё)
+      const off = loader === 'fabric' && otherRunningGames(gameDir).length
+        ? mods.secondGameDisabledMods(gameDir) : { ids: [] };
       if (off.ids.length) {
         secondGameArgs.push('-Dfabric.debug.disableModIds=' + off.ids.join(','));
         logLine('ⓘ В другом окне уже идёт игра — в этой выключено: ' + off.labels.join(', ')
@@ -2190,6 +2642,7 @@ async function launchGame(opts) {
     const ipcAddr = loader === 'fabric' ? await friendsync.issue(friendHandlers) : null;
     const proc = await launch({
       gamePath: gameDir,
+      resourcePath: resourceDir,
       javaPath,
       version: versionId,
       gameProfile: { name: account.name, id: account.uuid },
@@ -2215,7 +2668,8 @@ async function launchGame(opts) {
     gameProc = proc; // пока жив — закрытие окна не завершает лаунчер
     lastLaunch = { opts, gameDir, loader, mcVersion };
     friendRelaunch = null;
-    markGameRunning(mcVersion);
+    markGameRunning(mcVersion, gameDir);
+    const startedAt = Date.now();
 
     // Логи процесса (кратко) + хвост для разбора краша: если игра упала из-за
     // мижина стороннего мода, по этому хвосту находим виновника
@@ -2262,7 +2716,7 @@ async function launchGame(opts) {
       status('Игра запущена');
       send('state', { state: 'running' });
       if (loadConfig().discordRpc !== false) {
-        rpc.setPlaying(account.name, loader === 'fabric' ? 'Fabric' : loader === 'forge' ? 'Forge' : 'Vanilla');
+        rpc.setPlaying(account.name, LOADER_TITLES[loader] || 'Vanilla');
       }
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
     });
@@ -2271,6 +2725,13 @@ async function launchGame(opts) {
       markGameRunning(null);
       launching = false;
       logLine('■ Игра закрыта (код ' + code + ')');
+      // время в игре — как в Prism, по сборкам
+      try {
+        const c = loadConfig();
+        profiles.addPlayTime(c, profIdAtLaunch, Date.now() - startedAt);
+        saveConfig(c);
+        send('profiles-changed');
+      } catch (_) { /* учёт времени не обязателен */ }
       if (code !== 0 && crashReport) {
         logLine('Крэш-репорт: ' + crashReportLocation);
       }
