@@ -24,6 +24,7 @@ const versions = require('./versions');
 const buildSecret = require('./build-secret');
 const filelog = require('./filelog');
 const friendsync = require('./friendsync');
+const remotemods = require('./remotemods');
 
 // Файловый лог — раньше всего остального: падения на старте должны попасть
 // в журнал, даже если окно так и не открылось.
@@ -428,8 +429,25 @@ function ensureExecutable(javaPath) {
     logLine('! не удалось выставить права на java: ' + e.message);
   }
 }
+let remoteModsReady = false;
+/**
+ * Папка вшитых модов: кэш сборки по списку с сайта (remotemods.js), а пока его
+ * нет — моды, вшитые в exe. Обновить мод сборки можно без нового лаунчера.
+ */
 function modsResourceDir() {
-  return path.join(resourcesDir(), 'mods');
+  if (!remoteModsReady) {
+    remoteModsReady = true;
+    remotemods.init(app.getPath('userData'), path.join(resourcesDir(), 'mods'), app.getVersion());
+    mods.setOptIn(remotemods.optIn() || []);
+  }
+  return remotemods.dir();
+}
+/** Сверить моды сборки с сайтом; поменялись — сразу учесть необязательные. */
+async function refreshBundledMods(log) {
+  modsResourceDir();
+  const changed = await remotemods.refresh(log);
+  if (changed) mods.setOptIn(remotemods.optIn() || []);
+  return changed;
 }
 function configPath() {
   return path.join(app.getPath('userData'), 'launcher-config.json');
@@ -927,6 +945,20 @@ app.whenReady().then(() => {
   } catch (e) {
     filelog.line('моды при старте не пересобрались: ' + (e && e.message));
   }
+  // моды сборки с сайта — в фоне; набор поменялся — пересобрать папку игры
+  refreshBundledMods((s) => filelog.line(s)).then((changed) => {
+    if (!changed || gameRunning() || otherRunningGames().length) return;
+    try {
+      const cfg1 = loadConfig();
+      const dir1 = cfg1.gameDir || defaultGameDir();
+      if (fs.existsSync(dir1)) {
+        mods.syncMods(dir1, cfg1.loader || 'fabric', modsResourceDir(), (s) => filelog.line(s), currentMc(cfg1));
+      }
+      send('mods-changed');
+    } catch (e) {
+      filelog.line('моды после обновления сборки не пересобрались: ' + (e && e.message));
+    }
+  }).catch(() => {});
   setupAutoUpdate();
   translate.init(app.getPath('userData'));
   const cfg = loadConfig();
@@ -2020,7 +2052,14 @@ async function launchGame(opts) {
     }
 
     // 3) Синхронизация модов под выбранные загрузчик и версию игры (вшитые +
-    // установленные из лаунчера)
+    // установленные из лаунчера); перед ней — свежий набор модов сборки с сайта
+    if (loader === 'fabric') {
+      status('Проверка модов сборки…');
+      await Promise.race([
+        refreshBundledMods(logLine),
+        new Promise((r) => setTimeout(r, 60_000)),
+      ]);
+    }
     status('Синхронизация модов…');
     mods.syncMods(gameDir, loader, modsResourceDir(), logLine, mcVersion);
     // Требования модов друг к другу и к самой игре из fabric.mod.json (напр.

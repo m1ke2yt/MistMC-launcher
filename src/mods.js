@@ -6,7 +6,7 @@
 // ресурспаки → resourcepacks, шейдеры → shaderpacks (работают через Iris).
 // Выключенный файл = <file>.disabled. Реестр — <gameDir>/launcher-mods.json:
 //   { user: [{projectId, slug, title, iconUrl, fileName, type, loader, enabled}],
-//     bundledDisabled: ["file.jar"], bundledOptIn: ["MistWave-"] }
+//     bundledDisabled: ["file.jar"], bundledOptIn: ["Prefix-"] }
 
 const fs = require('fs');
 const path = require('path');
@@ -33,22 +33,36 @@ function bundledApplies(loader, mc) { return loader === 'fabric' && mc === BUNDL
 
 // Вшитые, но необязательные моды: лежат в сборке, а включает их сам игрок во
 // вкладке «Моды» (по умолчанию выключены). Ключ — начало имени файла: по нему
-// помним выбор, и он переживает смену версии игры и обновление мода.
-// MistWave — Яндекс Музыка в игре.
-const BUNDLED_OPT_IN = ['MistWave-'];
+// помним выбор, и он переживает смену версии игры и обновление мода. Список
+// приходит с сайта вместе со сборкой (remotemods.js), без него — пустой.
+let BUNDLED_OPT_IN = [];
+function setOptIn(list) {
+  BUNDLED_OPT_IN = Array.isArray(list) ? list.filter((k) => typeof k === 'string' && k) : [];
+}
 function optInKey(fileName) {
   const f = path.basename(String(fileName));
   return BUNDLED_OPT_IN.find((k) => f.startsWith(k)) || null;
 }
+/**
+ * Название мода без версии: MistWave-1.1.1+mc26.3.jar → mistwave. По нему
+ * помним, что игрок выключил вшитый мод, — выбор переживает обновление джарника.
+ */
+function modStem(fileName) {
+  return path.basename(String(fileName)).toLowerCase().replace(/\.jar$/, '').replace(/[-_+]v?\d.*$/, '');
+}
+function bundledDisabledHas(m, fileName) {
+  const stem = modStem(fileName);
+  return m.bundledDisabled.some((d) => d === fileName || modStem(d) === stem);
+}
 /** Включён ли вшитый джарник у этого игрока. */
 function bundledOn(m, fileName) {
   const key = optInKey(fileName);
-  return key ? m.bundledOptIn.includes(key) : !m.bundledDisabled.includes(fileName);
+  return key ? m.bundledOptIn.includes(key) : !bundledDisabledHas(m, fileName);
 }
 /** Вшитые джарники, которые сейчас выключены: выключенные игроком и невключённые необязательные. */
 function bundledOff(m, jars) {
   const out = m.bundledDisabled.slice();
-  for (const f of jars || []) if (optInKey(f) && !bundledOn(m, f) && !out.includes(f)) out.push(f);
+  for (const f of jars || []) if (!bundledOn(m, f) && !out.includes(f)) out.push(f);
   return out;
 }
 
@@ -892,7 +906,8 @@ function toggleBundledMod(gameDir, fileName, enabled) {
     m.bundledOptIn = m.bundledOptIn.filter((k) => k !== key);
     if (enabled) m.bundledOptIn.push(key);
   } else {
-    m.bundledDisabled = m.bundledDisabled.filter((f) => f !== fileName);
+    const stem = modStem(fileName);
+    m.bundledDisabled = m.bundledDisabled.filter((f) => f !== fileName && modStem(f) !== stem);
     if (!enabled) m.bundledDisabled.push(fileName);
   }
   const p = path.join(contentDir(gameDir, 'mod'), fileName);
@@ -2793,6 +2808,8 @@ function collectClientInventory(gameDir, bundledDir, loader, mc = BUNDLED_MC) {
 
 module.exports = {
   BUNDLED_MC,
+  setOptIn,
+  modStem,
   hasBundled,
   setLoaderVersion,
   setJavaMajor,
