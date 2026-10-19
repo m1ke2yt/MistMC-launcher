@@ -950,7 +950,10 @@ body.blocks-edit .ui-block::after {
 .inst-main::-webkit-scrollbar { width: 6px; }
 .inst-main::-webkit-scrollbar-thumb { background: var(--card-2); border-radius: 6px; }
 .inst-main > * { flex-shrink: 0; }
-.inst-head { display: flex; align-items: center; gap: 13px; }
+/* Шапка — слоем выше карточки: у блоков с прозрачностью/сдвигом (настройки
+   вида) свой слой, и карточка, идущая ниже по разметке, иначе ложится поверх
+   выпадающего меню «Папка» — пункты видны, но не нажимаются */
+.inst-head { display: flex; align-items: center; gap: 13px; position: relative; z-index: 20; }
 .inst-head-text { flex: 1; min-width: 0; }
 .inst-title {
   font-size: 22px; font-weight: 800; letter-spacing: .5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

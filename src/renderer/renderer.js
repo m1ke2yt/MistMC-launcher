@@ -4051,7 +4051,8 @@ els.btnPlay.addEventListener('click', async () => {
   if (!state.account) { openLogin(); return; }
   persist();
   setBusy(true);
-  els.logbox.hidden = false;
+  // журнал сам не открываем: он съедал место у панели сборки (как в Prism —
+  // по кнопке «лог» внизу); откроется сам только при ошибке или падении игры
   setProgress(-1);
   const res = await window.api.launch({
     ram: parseInt(els.ram.value, 10),
@@ -4061,6 +4062,7 @@ els.btnPlay.addEventListener('click', async () => {
     gameDir: state.gameDir,
   });
   if (!res || !res.ok) {
+    els.logbox.hidden = false;
     els.status.textContent = 'Ошибка: ' + (res && res.error ? res.error : 'неизвестно');
     setProgress(0);
     setBusy(false);
@@ -4074,8 +4076,13 @@ els.btnClose.addEventListener('click', () => window.api.close());
 
 window.api.onStatus((t) => { els.status.textContent = t; });
 window.api.onProgress((d) => { setProgress(d.percent); if (d.label) els.status.textContent = d.label; });
-window.api.onLog((l) => log(l));
+window.api.onLog((l) => {
+  log(l);
+  // что-то пошло не так — показываем журнал с причиной
+  if (/^(✖|⚑ Игра упала|Крэш-репорт)/.test(l)) els.logbox.hidden = false;
+});
 window.api.onLaunchError((msg) => {
+  els.logbox.hidden = false;
   els.status.textContent = 'Ошибка запуска: ' + msg;
   setBusy(false);
   setProgress(0);
