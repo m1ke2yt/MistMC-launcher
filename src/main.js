@@ -442,6 +442,28 @@ function modsResourceDir() {
   }
   return remotemods.dir();
 }
+/**
+ * Сверка модов сборки в фоне: набор на сайте поменялся — папка игры
+ * пересобирается (если игра не идёт: папка общая, тогда — при запуске) и
+ * список во вкладке «Моды» обновляется сам, без перезапуска лаунчера.
+ */
+function refreshBundledInBackground() {
+  refreshBundledMods((s) => filelog.line(s)).then((changed) => {
+    if (!changed) return;
+    if (!gameRunning() && !otherRunningGames().length) {
+      try {
+        const cfg1 = loadConfig();
+        const dir1 = cfg1.gameDir || defaultGameDir();
+        if (fs.existsSync(dir1)) {
+          mods.syncMods(dir1, cfg1.loader || 'fabric', modsResourceDir(), (s) => filelog.line(s), currentMc(cfg1));
+        }
+      } catch (e) {
+        filelog.line('моды после обновления сборки не пересобрались: ' + (e && e.message));
+      }
+    }
+    send('mods-changed');
+  }).catch(() => {});
+}
 /** Сверить моды сборки с сайтом; поменялись — сразу учесть необязательные. */
 async function refreshBundledMods(log) {
   modsResourceDir();
@@ -945,20 +967,10 @@ app.whenReady().then(() => {
   } catch (e) {
     filelog.line('моды при старте не пересобрались: ' + (e && e.message));
   }
-  // моды сборки с сайта — в фоне; набор поменялся — пересобрать папку игры
-  refreshBundledMods((s) => filelog.line(s)).then((changed) => {
-    if (!changed || gameRunning() || otherRunningGames().length) return;
-    try {
-      const cfg1 = loadConfig();
-      const dir1 = cfg1.gameDir || defaultGameDir();
-      if (fs.existsSync(dir1)) {
-        mods.syncMods(dir1, cfg1.loader || 'fabric', modsResourceDir(), (s) => filelog.line(s), currentMc(cfg1));
-      }
-      send('mods-changed');
-    } catch (e) {
-      filelog.line('моды после обновления сборки не пересобрались: ' + (e && e.message));
-    }
-  }).catch(() => {});
+  // моды сборки с сайта: сразу и дальше раз в 5 минут, пока лаунчер открыт
+  refreshBundledInBackground();
+  // период — 5 минут; для тестов — MISTMC_MODS_POLL_MS
+  setInterval(refreshBundledInBackground, +process.env.MISTMC_MODS_POLL_MS || 5 * 60_000);
   setupAutoUpdate();
   translate.init(app.getPath('userData'));
   const cfg = loadConfig();
@@ -1531,6 +1543,8 @@ function rememberJoinSupport(mc, ok) {
 }
 
 ipcMain.handle('mods-list', (_e, arg) => {
+  // открыли список модов — заодно свериться с сайтом (не чаще раза в 2 минуты)
+  refreshBundledInBackground();
   const { type, loader } = arg;
   const mc = mcOf(arg);
   try {

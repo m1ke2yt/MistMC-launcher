@@ -18,6 +18,8 @@ const { MAIN, MIRROR_DOWNLOADS } = require('./site');
 const MANIFEST = 'manifest.json';
 const LIST_TIMEOUT_MS = 8000;
 const FILE_TIMEOUT_MS = 90_000;
+// пауза между успешными проверками; для тестов — MISTMC_MODS_GAP_MS
+const OK_GAP_MS = +process.env.MISTMC_MODS_GAP_MS || 2 * 60_000;
 // путь джарника в сборке: корень или подпапка версии игры (26.1/…)
 const SAFE_PATH = /^(?:\d+\.\d+(?:\.\d+)?\/)?[A-Za-z0-9][A-Za-z0-9._+-]*\.jar$/;
 
@@ -28,6 +30,7 @@ let active = null;
 let activeManifest = null;
 let refreshing = null;
 let lastOk = 0;
+let lastFail = 0;
 
 /** Откуда качать: сайт и зеркало релизов. Пусто — сборка из исходников. */
 function bases() {
@@ -216,18 +219,19 @@ async function doRefresh(log) {
 /**
  * Сверить сборку со списком на сайте. true — набор модов поменялся. Ошибки не
  * пробрасываются: игра запускается с тем, что есть. Повторный вызов во время
- * проверки ждёт ту же проверку; успешная проверка не повторяется 2 минуты.
+ * проверки ждёт ту же проверку; успешная проверка не повторяется 2 минуты, неудачная — 30 секунд.
  */
 function refresh(log) {
   if (!bases().length || !cacheDir) return Promise.resolve(false);
   if (refreshing) return refreshing;
-  if (Date.now() - lastOk < 2 * 60_000) return Promise.resolve(false);
+  if (Date.now() - lastOk < OK_GAP_MS || Date.now() - lastFail < Math.min(30_000, OK_GAP_MS)) return Promise.resolve(false);
   refreshing = doRefresh(log)
     .then((changed) => {
       lastOk = Date.now();
       return changed;
     })
     .catch((e) => {
+      lastFail = Date.now();
       if (log) log('список модов с сайта не обновился: ' + (e && e.message));
       return false;
     })
