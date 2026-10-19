@@ -209,9 +209,10 @@
       </div>
       <div class="row">
         <label class="field field-ram">
-          <span class="label">Оперативная память: <b id="ram-val">4096</b> МБ</span>
-          <input id="ram" type="range" min="2048" max="16384" step="512" value="4096" />
-          <span class="hint scale"><span>2 ГБ</span><span>16 ГБ</span></span>
+          <span class="label ram-label">Оперативная память:
+            <input id="ram-val" type="number" min="1024" max="16384" step="256" value="4096" /> МБ</span>
+          <input id="ram" type="range" min="1024" max="16384" step="512" value="4096" />
+          <span class="hint scale"><span id="ram-lo">1 ГБ</span><span id="ram-hi">16 ГБ</span></span>
         </label>
       </div>
 

@@ -17,6 +17,7 @@ if (!window.api) {
         { id: '1.21.11', server: true, java: 21, supported: true, reason: '' },
       ],
       account: null,
+      totalMemMb: 32694,
     }),
     gameVersions: async () => null,
     setGameVersion: async (id) => ({
@@ -615,7 +616,7 @@ function updateVersionUI() {
 
 function persist() {
   return window.api.saveConfig({
-    ram: parseInt(els.ram.value, 10),
+    ram: ramValue(),
     loader: state.loader,
     joinServer: els.joinServer.checked,
     discordRpc: els.discordRpc.checked,
@@ -3811,7 +3812,6 @@ $('prism-run').addEventListener('click', async () => {
   const lines = [];
   for (const it of (res && res.report) || []) {
     lines.push('✔ ' + it.name + ' — модов: ' + it.mods + ', файлов: ' + it.files);
-    if (it.blocked.length) lines.push('   ⛔ не перенесены (запрещены на Mist MC): ' + it.blocked.join(', '));
     for (const n of it.notes) lines.push('   ⓘ ' + n);
   }
   if (res && res.addedNicks && res.addedNicks.length) lines.push('✔ Ники добавлены: ' + res.addedNicks.join(', '));
@@ -3863,10 +3863,38 @@ $('prism-banner-close').addEventListener('click', () => {
   try { localStorage.setItem(PRISM_BANNER_KEY, '1'); } catch (_) { /* не запомнили — покажем ещё раз */ }
 });
 
+// ── память ──────────────────────────────────────────────────────────────
+// Число вводится в поле, ползунок двигается вместе с ним; границы — от
+// min ползунка до всей памяти компьютера.
+function fmtGb(mb) {
+  return mb < 1024 ? mb + ' МБ' : Math.round(mb / 1024) + ' ГБ';
+}
+function setRamRange(min, max, step) {
+  els.ram.min = els.ramVal.min = min;
+  els.ram.max = els.ramVal.max = max;
+  els.ram.step = step;
+  $('ram-lo').textContent = fmtGb(min);
+  $('ram-hi').textContent = fmtGb(max);
+}
+function clampRam(v) {
+  const min = parseInt(els.ram.min, 10);
+  const max = parseInt(els.ram.max, 10);
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : 4096;
+}
+function setRam(v) {
+  const n = clampRam(v);
+  els.ram.value = n;
+  els.ramVal.value = n;
+}
+function ramValue() {
+  return clampRam(els.ramVal.value);
+}
+
 // ── init ────────────────────────────────────────────────────────────────
 async function init() {
   const res = await window.api.getConfig();
-  const { config, bgMedia, arch } = res;
+  const { config, bgMedia, arch, totalMemMb } = res;
   // тему применяем первым делом, чтобы не мигнуть стандартной
   state.theme = config.theme || {};
   state.bgMedia = bgMedia || null;
@@ -3874,15 +3902,10 @@ async function init() {
   applyBackground(state.bgMedia, state.theme);
   if (arch === 'ia32') {
     // 32-битный JVM не поднимет кучу больше ~1 ГБ — ползунок честно урезаем
-    els.ram.min = 512;
-    els.ram.max = 1024;
-    els.ram.step = 128;
-    const scale = els.ram.closest('.field')?.querySelector('.hint.scale');
-    if (scale) {
-      const [lo, hi] = scale.querySelectorAll('span');
-      if (lo) lo.textContent = '512 МБ';
-      if (hi) hi.textContent = '1 ГБ';
-    }
+    setRamRange(512, 1024, 128);
+  } else if (totalMemMb > 0) {
+    // потолок — вся память компьютера
+    setRamRange(1024, Math.max(2048, totalMemMb), 512);
   }
   applyConfig(res);
   updateAccountUI();
@@ -3893,8 +3916,7 @@ async function init() {
 
 /** Всё, что зависит от выбранной сборки: версия, загрузчик, память, папка. */
 function applyConfig({ config, versionInfo, gameVersions, account, accounts, profiles }) {
-  els.ram.value = Math.min(config.ram || 4096, parseInt(els.ram.max, 10));
-  els.ramVal.textContent = els.ram.value;
+  setRam(config.ram || 4096);
   els.joinServer.checked = config.joinServer !== false;
   els.discordRpc.checked = config.discordRpc !== false;
   state.gameDir = config.gameDir || '';
@@ -3928,8 +3950,13 @@ function refreshGameVersions() {
 }
 
 // ── события ─────────────────────────────────────────────────────────────
-els.ram.addEventListener('input', () => { els.ramVal.textContent = els.ram.value; });
+els.ram.addEventListener('input', () => { els.ramVal.value = els.ram.value; });
 els.ram.addEventListener('change', persist);
+els.ramVal.addEventListener('input', () => {
+  if (els.ramVal.value !== '') els.ram.value = clampRam(els.ramVal.value);
+});
+els.ramVal.addEventListener('change', () => { setRam(els.ramVal.value); persist(); });
+els.ramVal.addEventListener('keydown', (e) => { if (e.key === 'Enter') els.ramVal.blur(); });
 els.joinServer.addEventListener('change', () => { persist(); if (!isMain()) updateVersionUI(); });
 els.discordRpc.addEventListener('change', persist);
 
@@ -4055,7 +4082,7 @@ els.btnPlay.addEventListener('click', async () => {
   // по кнопке «лог» внизу); откроется сам только при ошибке или падении игры
   setProgress(-1);
   const res = await window.api.launch({
-    ram: parseInt(els.ram.value, 10),
+    ram: ramValue(),
     loader: state.loader,
     mcVersion: state.mc,
     joinServer: els.joinServer.checked,

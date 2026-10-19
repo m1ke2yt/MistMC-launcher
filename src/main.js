@@ -1269,6 +1269,7 @@ ipcMain.handle('get-config', () => {
     ...accountsPayload(config),
     bgMedia: bgMedia(config.theme && config.theme.bgImage),
     arch: process.arch, // ia32-сборке renderer урезает ползунок памяти
+    totalMemMb: Math.floor(os.totalmem() / 1048576), // потолок памяти игры
   };
 });
 // Renderer шлёт только игровые настройки — мержим по белому списку, иначе
@@ -1629,7 +1630,6 @@ ipcMain.handle('prism-import', async (_e, { root, ids, accounts } = {}) => {
       saveConfig(cfg);
       firstId = firstId || p.id;
       const res = await prism.copyInstance(inst, p.dir, {
-        checkMod: (file) => mods.blockedJar(file, mods.jarModInfo(file)),
         onProgress: (pr) => send('import-progress', { title: head, ...pr }),
       });
       if (inst.iconFile) {
@@ -1659,8 +1659,7 @@ ipcMain.handle('prism-import', async (_e, { root, ids, accounts } = {}) => {
         blocked: [...new Set(res.blocked)],
         notes,
       });
-      logLine('  ✓ скопировано файлов ' + res.copied + ', модов ' + res.mods + (res.blocked.length
-        ? ', не перенесены (запрещены на Mist MC): ' + [...new Set(res.blocked)].join(', ') : ''));
+      logLine('  ✓ скопировано файлов ' + res.copied + ', модов ' + res.mods);
     }
     // офлайн-ники из Prism — в наш список аккаунтов
     const addedNicks = [];
@@ -2383,7 +2382,8 @@ async function launchGame(opts) {
   const loader = loaderOk.includes(opts.loader) ? opts.loader : (cfgL.loader || 'fabric');
   const mistOn = mistModsOn(cfgL);
   // 32-битный процесс адресует ~2 ГБ на всё: больше ~1 ГБ кучи JVM не поднимет
-  const ramCap = process.arch === 'ia32' ? 1024 : 32768;
+  // 64-битной — сколько памяти у компьютера, столько и можно
+  const ramCap = process.arch === 'ia32' ? 1024 : Math.max(2048, Math.floor(os.totalmem() / 1048576));
   const ram = Math.max(process.arch === 'ia32' ? 512 : 1024, Math.min(ramCap, parseInt(opts.ram, 10) || 4096));
   const friendJoin = typeof opts.friendJoin === 'string' && NICK_RE.test(opts.friendJoin) ? opts.friendJoin : null;
   // идём к другу — на сервер сами не подключаемся
@@ -2525,6 +2525,8 @@ async function launchGame(opts) {
       ]);
     }
     status('Синхронизация модов…');
+    // моды, выключенные прошлыми версиями как «запрещённые», — обратно
+    try { mods.restoreBlockedMods(gameDir, logLine); } catch (_) { /* запуск важнее */ }
     mods.syncMods(gameDir, loader, modsResourceDir(), logLine, mcVersion, { noBundled: !mistOn });
     // Требования модов друг к другу и к самой игре из fabric.mod.json (напр.
     // Replay Voice Chat требует Replay Mod ровно 2.6.25) — чиним ДО запуска;
@@ -2532,17 +2534,6 @@ async function launchGame(opts) {
     try {
       await mods.enforceJarDeps(gameDir, loader, mcVersion, logLine);
     } catch (_) { /* без сети играем как есть */ }
-    // 3.2) Freecam: непатченные джарники (с пролётом сквозь стены) подменяются
-    // честной сборкой Mist; без сети — усыпляются, играем без freecam
-    try {
-      await mods.enforceFairFreecam(gameDir, logLine, mcVersion);
-    } catch (_) { /* запуск важнее */ }
-    // 3.3) Запрещённые на сервере моды (JourneyMap) выключаем до входа —
-    // иначе игрока кикнет сервер, а причина останется непонятной
-    try {
-      const banned = mods.enforceBlockedMods(gameDir, logLine);
-      if (banned.length) logLine('⚑ ' + banned.join(', ') + ': на Mist MC запрещён, выключен перед запуском.');
-    } catch (_) { /* запуск важнее */ }
 
     // Паки и плащи Mist MC собраны под версию сервера и работают через вшитые
     // моды — на другой версии игры они только сыпали бы ошибками в журнал.

@@ -209,61 +209,9 @@ async function robustFetch(url, init) {
   throw lastErr || new Error('нет соединения');
 }
 
-// ── читерное: скрываем из поиска и не даём поставить ────────────────────
-// Паттерны гоняются по slug + названию + описанию (моды-камеры и x-ray любят
-// палиться только в описании). Разрешены отдельно: legacyfreecam («Freecam
-// (Fair Play)» — камера НЕ проходит сквозь стены) и анти-чит/анти-freecam моды.
-const BLOCK_PATTERNS = [
-  /x[-_ ]?ray/i,
-  /free[-_ ]?cam/i,
-  /wall[-_ ]?hack/i,
-  /wurst|meteor.?client|baritone|bleach.?hack|aristois|inertia.?client/i,
-  /seed.?crack/i,
-  /auto.?click|kill.?aura|auto.?fish|elytra.?fly|air.?place|scaffold.?walk/i,
-  // именно поисковики руд; «highlight» сюда не включаем — эмиссивные паки
-  // светящихся руд (Glowing Ores) читом не являются
-  /(ore|diamond|mineral|dungeon|spawner).{0,12}(finder|scanner|detector|locator)/i,
-  /cave.?(finder|map.?hack)/i,
-];
-const ANTI_RE = /anti.?(x[-_ ]?ray|free.?cam|cheat)/i;
-const BLOCK_SLUGS = new Set([
-  'litematica-printer', // принтер режется античитом Mist MC
-  'journeymap', // пещерный режим карты сервером не закрывается — на Mist MC мод запрещён, сервер кикает
-]);
-// Моды, которые лаунчер выключает перед запуском, даже если игрок закинул
-// джарник руками: по fabric-id и по имени файла (forge-сборки без fabric.mod.json).
-const BLOCKED_MODS = [
-  { ids: new Set(['journeymap']), fileRe: /journeymap/i, label: 'JourneyMap' },
-];
-const ALLOW_SLUGS = new Set(['legacyfreecam']);
-
-// «Freecam (Fair Play)» с Modrinth на деле собран ОБЫЧНЫМ вариантом мода:
-// в его настройках включается «Игнорировать всю коллизию», и камера летает
-// сквозь стены (проверено 31.08 на 1.1.1+mc1.21.11 — в джарнике вариант
-// «normal», никакой блокировки читов нет). Поэтому Modrinth для этого мода
-// не источник: ставим и принудительно поддерживаем нашу сборку, из которой
-// вырезаны миксины коллизии (BlockStateBaseMixin) и полной яркости
-// (LightTextureMixin) — пункты в меню остаются, но не действуют.
-// Признак нашей сборки — файл-маркер mist-fairplay внутри джарника.
-const FAIR_FREECAM = {
-  projectId: 'tWqI1yhH',
-  slug: 'legacyfreecam',
-  modIds: new Set(['legacy-freecam', 'freecam']), // ловим и оригинальный freecam, закинутый руками
-  fileName: 'legacy-freecam-fabric-1.1.1+mc1.21.11-mist.jar',
-  marker: 'mist-fairplay',
-  versionId: 'mist-fairplay-1',
-  versionNumber: '1.1.1-mist',
-};
-function fairFreecamUrl() {
-  if (!site.MIRROR_DOWNLOADS) throw new Error('в сборке из исходников недоступно');
-  return site.MIRROR_DOWNLOADS + '/mods/' + encodeURIComponent(FAIR_FREECAM.fileName);
-}
-function isBlocked(text, slug) {
-  if (ALLOW_SLUGS.has(slug)) return false;
-  if (BLOCK_SLUGS.has(slug)) return true;
-  if (ANTI_RE.test(text)) return false; // защитные моды («Anti Xray», «Anti Freecam»)
-  return BLOCK_PATTERNS.some((re) => re.test(text));
-}
+// Версия «честной» сборки Freecam, которую ставили лаунчеры до 1.8.18:
+// на Modrinth её нет — за её зависимостями туда не ходим.
+const MIST_FREECAM_VERSION = 'mist-fairplay-1';
 
 // ── типы контента ───────────────────────────────────────────────────────
 const TYPES = {
@@ -300,7 +248,7 @@ const BUILTIN_CURATED = {
     { slug: 'clientsort', ru: 'Сортировка инвентаря колёсиком/клавишей' },
     { slug: 'emotecraft', ru: 'Жесты и эмоции — поддерживается на Mist MC' },
     { slug: 'bendable-cuboids', ru: 'Сгибы конечностей для эмоций Emotecraft' },
-    { slug: 'legacyfreecam', ru: 'Свободная камера Fair Play — сквозь стены НЕ пролетает' },
+    { slug: 'legacyfreecam', ru: 'Свободная камера: отлететь и посмотреть со стороны' },
     { slug: 'lambdynamiclights', ru: 'Динамический свет: факел светит в руке' },
     { slug: 'litematica', ru: 'Схематика построек: проекция блоков для строительства' },
     { slug: 'patpat', ru: 'Гладь игроков и питомцев по голове (ПКМ + shift)' },
@@ -310,6 +258,7 @@ const BUILTIN_CURATED = {
     { slug: 'appleskin', ru: 'Показывает сытость и питательность еды' },
     { slug: 'mouse-tweaks', ru: 'Удобное перетаскивание предметов мышью' },
     { slug: 'shulkerboxtooltip', ru: 'Содержимое шалкера видно прямо в подсказке' },
+    { slug: 'clickthrough-plus', ru: 'Сундук открывается сквозь табличку и рамку' },
     { slug: 'continuity', ru: 'Соединённые текстуры стекла и блоков' },
     { slug: '3dskinlayers', ru: 'Объёмные слои скина — шапки и куртки в 3D' },
     { slug: 'not-enough-animations', ru: 'Реалистичные анимации от третьего лица' },
@@ -352,8 +301,6 @@ function parseCurated(body) {
   for (const t of CURATED_TYPES) {
     const list = (Array.isArray(src[t]) ? src[t] : [])
       .filter((c) => c && typeof c.slug === 'string' && CURATED_SLUG_RE.test(c.slug))
-      // запрещённое не рекомендуем, даже если оно попало в список на сайте
-      .filter((c) => !isBlocked(c.slug, c.slug))
       .map((c) => ({ slug: c.slug, ru: typeof c.ru === 'string' ? c.ru.slice(0, 200) : '' }));
     out[t] = list.length ? list : BUILTIN_CURATED[t];
   }
@@ -552,19 +499,6 @@ function jarModInfo(file) {
   return null;
 }
 
-/**
- * Запрещённый ли мод (читы, JourneyMap) — по описанию из джарника и имени файла.
- * Для переноса из других лаунчеров: такое не копируем вовсе.
- */
-function blockedJar(file, info) {
-  const base = path.basename(file).replace(/\.disabled$/i, '');
-  if (info && FAIR_FREECAM.modIds.has(info.id) && readZipEntry(file, FAIR_FREECAM.marker)) return null;
-  const rule = BLOCKED_MODS.find((r) => (info && r.ids.has(info.id)) || r.fileRe.test(base));
-  if (rule) return rule.label;
-  const text = [base, info && info.id, info && info.name, info && info.description].filter(Boolean).join(' ');
-  return isBlocked(text, info ? String(info.id).toLowerCase() : '') ? ((info && info.name) || base) : null;
-}
-
 function sha1File(file) {
   return require('crypto').createHash('sha1').update(fs.readFileSync(file)).digest('hex');
 }
@@ -666,9 +600,7 @@ async function searchContent(query, type, loader, mcVersion) {
     + '&facets=' + encodeURIComponent(JSON.stringify(facets))
     + (query ? '' : '&index=downloads');
   const data = await apiGet(url);
-  return (data.hits || [])
-    .filter((h) => !isBlocked([h.slug, h.title, h.description].join(' '), h.slug))
-    .map(hitToItem);
+  return (data.hits || []).map(hitToItem);
 }
 
 // ── популярные (кураторские подборки) ───────────────────────────────────
@@ -824,9 +756,6 @@ async function fetchVersionFile(version, file, dest, log) {
 }
 
 async function installContent(gameDir, project, type, loader, mcVersion, log, depth = 0, pinnedVersionId = null, opts = {}) {
-  if (isBlocked([project.slug, project.title, project.description].filter(Boolean).join(' '), project.slug)) {
-    return { ok: false, error: 'Этот мод запрещён на Mist MC' };
-  }
   // вшитый в сборку мод уже стоит — вторая копия уронит Fabric
   if (type === 'mod' && bundledApplies(loader, mcVersion) && BUNDLED_PROJECTS.has(project.projectId)) {
     return { ok: true, already: true };
@@ -839,40 +768,6 @@ async function installContent(gameDir, project, type, loader, mcVersion, log, de
   const sameSlot = (e) => e.projectId === project.projectId && e.type === type
       && (!t.perLoader || e.loader === loader) && !e.pendingRemove;
   const existing = m.user.find((e) => sameSlot(e) && entryFitsMc(e, mcVersion));
-
-  // freecam ставится ТОЛЬКО нашей сборкой (см. FAIR_FREECAM) — пины и версии
-  // Modrinth к нему неприменимы
-  if (type === 'mod' && (project.slug === FAIR_FREECAM.slug || project.projectId === FAIR_FREECAM.projectId)) {
-    if (loader !== 'fabric') return { ok: false, error: 'Нет сборки под ' + mcVersion + ' / ' + loader };
-    // честная сборка собрана под версию сервера; под другие её нет
-    if (mcVersion !== BUNDLED_MC) {
-      return { ok: false, error: 'Честная сборка Freecam есть только под ' + BUNDLED_MC };
-    }
-    if (existing && existing.versionId === FAIR_FREECAM.versionId) return { ok: true, already: true };
-    if (existing) {
-      log('  ⟳ ' + existing.title + ': ' + (existing.versionNumber || '?') + ' → ' + FAIR_FREECAM.versionNumber);
-      removeUserContent(gameDir, 'mod', existing.fileName);
-    }
-    fs.mkdirSync(contentDir(gameDir, 'mod'), { recursive: true });
-    await downloadTo(fairFreecamUrl(), path.join(contentDir(gameDir, 'mod'), FAIR_FREECAM.fileName), log);
-    const withCam = readManifest(gameDir);
-    withCam.user.push({
-      projectId: FAIR_FREECAM.projectId,
-      slug: FAIR_FREECAM.slug,
-      title: project.title || 'Freecam (Fair Play)',
-      iconUrl: project.iconUrl || '',
-      fileName: FAIR_FREECAM.fileName,
-      type: 'mod',
-      loader,
-      enabled: true,
-      versionNumber: FAIR_FREECAM.versionNumber,
-      versionId: FAIR_FREECAM.versionId,
-      mc: BUNDLED_MC,
-    });
-    writeManifest(gameDir, withCam);
-    log('✓ Установлен ' + (project.title || 'Freecam (Fair Play)') + ' — сборка Mist MC, пролёт сквозь стены вырезан');
-    return { ok: true };
-  }
 
   // pinnedVersionId приходит от enforceJarDeps — это АВТОРИТЕТ (посчитан по
   // fabric.mod.json всех установленных модов), выполняем даже заменой стоящей
@@ -1760,7 +1655,7 @@ async function installMissingDep(gameDir, loader, mcVersion, log, by, depId) {
   };
 
   let installed = false;
-  if (by.entry.projectId && by.entry.versionId && by.entry.versionId !== FAIR_FREECAM.versionId) {
+  if (by.entry.projectId && by.entry.versionId && by.entry.versionId !== MIST_FREECAM_VERSION) {
     const v = await apiGet(API + '/version/' + encodeURIComponent(by.entry.versionId));
     for (const dep of v.dependencies || []) {
       if (dep.dependency_type !== 'required' || !dep.project_id) continue;
@@ -2136,85 +2031,31 @@ function syncMods(gameDir, loader, bundledDir, log, mc = BUNDLED_MC, opts = {}) 
 }
 
 /**
- * Freecam-надзор перед каждым запуском: любой джарник в mods с fabric-id
- * freecam/legacy-freecam БЕЗ нашего маркера (см. FAIR_FREECAM) — это сборка
- * с пролётом сквозь стены: и та, что каталог ставил до фикса, и закинутая
- * руками. Подменяем честной сборкой с раздачи; если сети нет — усыпляем
- * файл (fail closed): лучше без freecam, чем с читом.
+ * Лаунчеры до 1.8.18 усыпляли «запрещённые» моды (.banned.disabled — JourneyMap,
+ * .cheat.disabled — freecam с пролётом сквозь стены). Запрета больше нет —
+ * возвращаем их игроку. Звать ДО syncMods: дубль mod id (например, наш
+ * freecam рядом с оригиналом) syncMods сам уберёт в .dupe.disabled.
  */
-async function enforceFairFreecam(gameDir, log, mc = BUNDLED_MC) {
+function restoreBlockedMods(gameDir, log) {
   const dir = contentDir(gameDir, 'mod');
   let names = [];
   try { names = fs.readdirSync(dir); } catch (_) { return; }
   for (const f of names) {
-    if (!f.endsWith('.jar')) continue;
-    const full = path.join(dir, f);
-    let info = null;
-    try { info = fabricModInfo(full); } catch (_) { continue; }
-    if (!info || !FAIR_FREECAM.modIds.has(info.id)) continue;
-    if (readZipEntry(full, FAIR_FREECAM.marker)) continue; // уже наша сборка
-    // честная сборка есть только под версию сервера: на другой версии игры
-    // подменить нечем, поэтому непатченный freecam просто выключаем
-    if (mc !== BUNDLED_MC) {
-      try {
-        fs.renameSync(full, full + '.cheat.disabled');
-        log('  − ' + f + ': freecam с пролётом сквозь стены отключён (честной сборки под ' + mc + ' нет)');
-      } catch (_) { /* файл занят */ }
-      continue;
-    }
-    const dest = path.join(dir, FAIR_FREECAM.fileName);
+    const mm = /^(.+\.jar)\.(banned|cheat)\.disabled$/i.exec(f);
+    if (!mm) continue;
+    const base = mm[1];
+    const dest = path.join(dir, base);
+    if (fs.existsSync(dest)) continue;
     try {
-      if (!fs.existsSync(dest) || !readZipEntry(dest, FAIR_FREECAM.marker)) {
-        await downloadTo(fairFreecamUrl(), dest, log);
-      }
-      if (full !== dest) fs.unlinkSync(full);
-      log('  ⟳ ' + f + ' → честная сборка freecam (пролёт сквозь стены вырезан)');
-    } catch (e) {
-      try { fs.renameSync(full, full + '.cheat.disabled'); } catch (_) { /* файл занят */ }
-      log('  − ' + f + ': непатченный freecam отключён (честная сборка недоступна: ' + e.message + ')');
-      continue;
-    }
-    const m = readManifest(gameDir);
-    const entry = m.user.find((e2) => e2.type === 'mod' && e2.fileName === f)
-      || m.user.find((e2) => e2.type === 'mod' && e2.projectId === FAIR_FREECAM.projectId);
-    if (entry) {
-      entry.fileName = FAIR_FREECAM.fileName;
-      entry.versionNumber = FAIR_FREECAM.versionNumber;
-      entry.versionId = FAIR_FREECAM.versionId;
-      writeManifest(gameDir, m);
-    }
-  }
-}
-
-/**
- * Запрещённые на Mist MC моды (BLOCKED_MODS) усыпляем перед запуском:
- * сервер всё равно кикнет за их каналы, лучше объяснить это до входа.
- * Возвращает список выключенных ярлыков (для сообщения игроку).
- */
-function enforceBlockedMods(gameDir, log) {
-  const dir = contentDir(gameDir, 'mod');
-  let names = [];
-  try { names = fs.readdirSync(dir); } catch (_) { return []; }
-  const hit = [];
-  for (const f of names) {
-    if (!f.endsWith('.jar')) continue;
-    const full = path.join(dir, f);
-    let info = null;
-    try { info = fabricModInfo(full); } catch (_) { /* не fabric-джарник */ }
-    const rule = BLOCKED_MODS.find((r) => (info && r.ids.has(info.id)) || r.fileRe.test(f));
-    if (!rule) continue;
-    try {
-      fs.renameSync(full, full + '.banned.disabled');
+      fs.renameSync(path.join(dir, f), dest);
       const m = readManifest(gameDir);
-      const e = m.user.find((x) => x.type === 'mod' && x.fileName === f);
-      if (e) { e.enabled = false; writeManifest(gameDir, m); }
-      log('  − ' + f + ': ' + rule.label + ' запрещён на Mist MC — выключен');
-      hit.push(rule.label);
+      const e = m.user.find((x) => x.type === 'mod' && x.fileName === base);
+      if (e && e.enabled === false) { e.enabled = true; writeManifest(gameDir, m); }
+      log('  + ' + base + ': снова включён (запрета на моды больше нет)');
     } catch (e) {
-      log('  ! не смог выключить ' + f + ': ' + e.message);
+      log('  ! не смог вернуть ' + base + ': ' + e.message);
     }
   }
-  return hit;
 }
 
 /**
@@ -2734,10 +2575,6 @@ async function projectVersions(gameDir, projectId, type, loader, mc) {
   const t = typeInfo(type);
   const cur = readManifest(gameDir).user.find((e) => e.projectId === projectId && e.type === type
     && (!t.perLoader || e.loader === loader) && !e.pendingRemove && entryFitsMc(e, mc));
-  // freecam ставится только честной сборкой Mist — выбирать не из чего
-  if (type === 'mod' && projectId === FAIR_FREECAM.projectId) {
-    return { fixed: true, installedId: cur ? cur.versionId : null, pinned: false, recommendedId: null, versions: [] };
-  }
   const versions = await listProjectVersions(projectId, loader, mc, type);
   const rec = versions.find((v) => v.version_type === 'release') || versions[0] || null;
   return {
@@ -2821,7 +2658,6 @@ const ALT_PROBE_BYTES = 24 * 1024 * 1024;
 async function checkCompat(gameDir, project, type, loader, mc, versionId) {
   const out = { ok: true, version: null, issues: [], alt: null, deep: false };
   if (type !== 'mod') return out; // паки и шейдеры друг другу не мешают
-  if (project.slug === FAIR_FREECAM.slug || project.projectId === FAIR_FREECAM.projectId) return out;
   const version = await pickVersion(project.projectId, type, loader, mc, versionId || null);
   if (!version) {
     out.ok = false;
@@ -2994,7 +2830,7 @@ module.exports = {
   migrateCandidates,
   migrateToMc,
   reviveAutoOff,
-  enforceBlockedMods,
+  restoreBlockedMods,
   listContent,
   searchContent,
   popularContent,
@@ -3008,13 +2844,11 @@ module.exports = {
   secondGameDisabledMods,
   syncMods,
   enforceJarDeps,
-  enforceFairFreecam,
   collectClientInventory,
   exportBuild,
   applyBuild,
   readZipEntry,
   jarModInfo,
-  blockedJar,
   adoptContent,
   // разбор версий — чистые функции, вынесены наружу для тестов
   fabricModInfo,

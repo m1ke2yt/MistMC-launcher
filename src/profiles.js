@@ -12,6 +12,7 @@
 // От Electron модуль не зависит — гоняется тестами в чистом node.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
@@ -143,7 +144,10 @@ function update(cfg, id, patch) {
     p.loader = patch.loader;
   }
   if ('loaderVersion' in patch) p.loaderVersion = patch.loaderVersion || undefined;
-  if (patch.ram) p.ram = Math.max(1024, Math.min(32768, Number(patch.ram) || p.ram));
+  if (patch.ram) {
+    const total = Math.max(2048, Math.floor(os.totalmem() / 1048576));
+    p.ram = Math.max(1024, Math.min(total, Math.round(Number(patch.ram)) || p.ram));
+  }
   if ('joinServer' in patch) p.joinServer = !!patch.joinServer;
   if ('mistMods' in patch) p.mistMods = !!patch.mistMods;
   return p;
