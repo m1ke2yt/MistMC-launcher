@@ -4320,9 +4320,12 @@ init();
       // не помещались и кнопку выдавливало за край модалки
       makeBtn.hidden = true;
       copyBtn.hidden = false;
-      const what = res.filesInfo
+      const what = (res.filesInfo
         ? ' В коде: ' + describeBuild(0, res.filesInfo).replace(/^ · /, '') + '.'
-        : '';
+        : '')
+        + (res.filesInfo && res.filesInfo.hidden
+          ? ' Файлы со входом в аккаунты (' + res.filesInfo.hidden + ') не взяты.'
+          : '');
       shareHint.textContent = (res.reused
         ? 'Этот код уже был создан для такой же сборки — им и делись.'
         : 'Готово! Отправь код друзьям — у них соберётся то же самое.') + what;

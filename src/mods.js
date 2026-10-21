@@ -2244,6 +2244,22 @@ const SHARE_EXT = new Set(['.json', '.json5', '.toml', '.cfg', '.conf', '.proper
 // лежат переводы на два десятка языков)
 const SHARE_SKIP_DIRS = new Set(['cache', 'caches', 'logs', 'backup', 'backups', 'temp', 'tmp']);
 
+// Входы в аккаунты: токен Яндекс Музыки (MistWave), сессия MistSocial, аккаунты
+// ViaFabricPlus/In-Game Account Switcher, ключ шифрования No Chat Reports.
+// Такие файлы код сборки не несёт ни под какой галочкой и из чужого кода не
+// кладёт: код уходит на сайт и открывается любым, кто его знает.
+const SHARE_PRIVATE_PATH = /(^|\/)(mistwave\.json|mistsocial\/|viafabricplus\/|ias\.json|nochatreports\/)|account|auth|token|secret|credential|session|passw|login|cookie|keystore|\.key$/i;
+// незнакомый мод с ключом в конфиге: ловим по имени поля и по виду значения
+const SHARE_SECRET_FIELD = /["']?[\w.-]*(token|passw|passphrase|secret|api[_-]?key|cookie|credential|private[_-]?key|session|bearer|device[_-]?id)[\w.-]*["']?\s*[:=]\s*["']?[^\s"',}\]#]{6,}/i;
+const SHARE_SECRET_VALUE = /\by0_[\w-]{20,}|\beyJ[\w-]{10,}\.[\w-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+
+/** Файл с входом в аккаунт — в код сборки ему нельзя ни туда, ни обратно. */
+function sharePrivate(relPath, content) {
+  if (SHARE_PRIVATE_PATH.test(String(relPath || '').replace(/\\/g, '/'))) return true;
+  return typeof content === 'string'
+    && (SHARE_SECRET_FIELD.test(content) || SHARE_SECRET_VALUE.test(content));
+}
+
 /** Категория файла для галочек; null — файл в код сборки не допускается. */
 function shareCategory(relPath) {
   const p = String(relPath || '').replace(/\\/g, '/');
@@ -2271,8 +2287,11 @@ function walkConfigDir(dir, base, out, state, depth = 0) {
       let st;
       try { st = fs.statSync(full); } catch (_) { continue; }
       if (st.size > SHARE_MAX_FILE || state.bytes + st.size > SHARE_MAX_RAW) continue;
+      if (SHARE_PRIVATE_PATH.test(rel)) { state.hidden++; continue; }
       try {
-        out[rel] = fs.readFileSync(full, 'utf8');
+        const text = fs.readFileSync(full, 'utf8');
+        if (sharePrivate(rel, text)) { state.hidden++; continue; }
+        out[rel] = text;
         state.bytes += st.size;
       } catch (_) { /* нечитаемый файл пропускаем */ }
     }
@@ -2282,8 +2301,8 @@ function walkConfigDir(dir, base, out, state, depth = 0) {
 /** Собрать выбранные настройки: { map: {путь: содержимое}, info } */
 function collectShareFiles(gameDir, parts) {
   const map = {};
-  const state = { bytes: 0 };
-  const info = { configs: 0, options: false, shaders: 0, bytes: 0 };
+  const state = { bytes: 0, hidden: 0 };
+  const info = { configs: 0, options: false, shaders: 0, bytes: 0, hidden: 0 };
   if (parts && parts.configs) {
     walkConfigDir(path.join(gameDir, 'config'), 'config', map, state);
     info.configs = Object.keys(map).length;
@@ -2292,8 +2311,10 @@ function collectShareFiles(gameDir, parts) {
     const p = path.join(gameDir, 'options.txt');
     try {
       const st = fs.statSync(p);
-      if (st.size <= SHARE_MAX_FILE) {
-        map['options.txt'] = fs.readFileSync(p, 'utf8');
+      const text = st.size <= SHARE_MAX_FILE ? fs.readFileSync(p, 'utf8') : null;
+      if (text !== null && sharePrivate('options.txt', text)) state.hidden++;
+      else if (text !== null) {
+        map['options.txt'] = text;
         state.bytes += st.size;
         info.options = true;
       }
@@ -2307,13 +2328,17 @@ function collectShareFiles(gameDir, parts) {
         const p = path.join(dir, f);
         const st = fs.statSync(p);
         if (!st.isFile() || st.size > SHARE_MAX_FILE) continue;
-        map[path.posix.join('shaderpacks', f)] = fs.readFileSync(p, 'utf8');
+        const rel = path.posix.join('shaderpacks', f);
+        const text = fs.readFileSync(p, 'utf8');
+        if (sharePrivate(rel, text)) { state.hidden++; continue; }
+        map[rel] = text;
         state.bytes += st.size;
         info.shaders++;
       }
     } catch (_) { /* нет шейдеров */ }
   }
   info.bytes = state.bytes;
+  info.hidden = state.hidden;
   return { map, info };
 }
 
@@ -2380,6 +2405,8 @@ function applyShareFiles(gameDir, build, parts, log) {
   for (const [rel, content] of Object.entries(map)) {
     const cat = shareCategory(rel);
     if (!cat || !parts || !parts[cat] || typeof content !== 'string') { res.skipped++; continue; }
+    // чужой токен не должен лечь поверх своего (и не должен вообще)
+    if (sharePrivate(rel, content)) { res.skipped++; continue; }
     const dest = path.join(gameDir, rel.replace(/\//g, path.sep));
     // финальная страховка: результат обязан остаться внутри папки игры
     if (!path.resolve(dest).startsWith(path.resolve(gameDir) + path.sep)) { res.skipped++; continue; }
@@ -2961,6 +2988,7 @@ module.exports = {
   collectClientInventory,
   exportBuild,
   applyBuild,
+  sharePrivate,
   readZipEntry,
   jarModInfo,
   adoptContent,
