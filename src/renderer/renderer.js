@@ -211,6 +211,7 @@ const els = {
   modmTitle: $('modm-title'),
   modmDownloads: $('modm-downloads'),
   modmLink: $('modm-link'),
+  modmVote: $('modm-vote'),
   modmLang: $('modm-lang'),
   modmLinkSep: $('modm-linksep'),
   modmClose: $('modm-close'),
@@ -786,12 +787,22 @@ function installedRow(mod, bundled, foreign, issues) {
   meta.append(t, s);
   row.appendChild(meta);
 
-  // клик по строке (не по управлению) — карточка мода; у вшитых нет projectId
+  // клик по строке (не по управлению) — карточка мода; у вшитых нет
+  // projectId, кроме своих модов со страницей
   if (!bundled && mod.projectId) {
     row.classList.add('clickable');
     row.addEventListener('click', (e) => {
       if (e.target.closest('.mod-controls')) return;
       openModModal(mod);
+    });
+  } else if (bundled && mod.mistId) {
+    row.classList.add('clickable');
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.mod-controls')) return;
+      openModModal({
+        mist: true, projectId: 'mist:' + mod.mistId, slug: mod.mistId, title: mod.title,
+        iconUrl: mod.iconUrl, description: mod.description, fileName: mod.fileName, enabled: mod.enabled,
+      });
     });
   }
 
@@ -1042,13 +1053,14 @@ function renderResults(hits) {
     t.className = 'mod-title';
     t.textContent = h.title;
     const dl = document.createElement('span');
-    dl.className = 'mod-dl';
-    dl.textContent = h.rating
-      ? '👍 ' + h.rating.likes + (h.rating.dislikes ? ' · 👎 ' + h.rating.dislikes : '')
-      : '⬇ ' + fmtDownloads(h.downloads);
+    dl.className = 'mod-dl' + (h.mist ? ' mod-mist' : '');
+    dl.textContent = h.mist ? 'от Mist MC'
+      : h.rating
+        ? '👍 ' + h.rating.likes + (h.rating.dislikes ? ' · 👎 ' + h.rating.dislikes : '')
+        : '⬇ ' + fmtDownloads(h.downloads);
     t.appendChild(dl);
     // счётчик оценок появится, когда ответит сайт (в топе он уже в строке)
-    if (!h.rating) {
+    if (!h.rating && !h.mist) {
       const vote = document.createElement('span');
       vote.className = 'mod-dl mod-votes';
       vote.dataset.ratingFor = h.projectId;
@@ -1071,7 +1083,9 @@ function renderResults(hits) {
     controls.className = 'mod-controls';
     const btn = document.createElement('button');
     btn.className = 'btn-accent btn-install';
-    if (state.installedIds.has(h.projectId)) {
+    if (h.mist) {
+      mistInstallButton(btn, h);
+    } else if (state.installedIds.has(h.projectId)) {
       btn.textContent = '✓ Установлен';
       btn.disabled = true;
     } else {
@@ -1099,7 +1113,39 @@ function renderResults(hits) {
     els.listResults.appendChild(row);
   }
   stagger(els.listResults);
-  loadRatings(hits.map((h) => h.projectId));
+  loadRatings(hits.filter((h) => !h.mist).map((h) => h.projectId));
+}
+
+/**
+ * Свой мод Mist MC вшит в сборку, но выключен: «Установить» включает его
+ * (как тумблер в «Установленных»), выключить можно там же.
+ */
+async function enableMistMod(h) {
+  const res = await window.api.modToggle('mod', h.fileName, true, true, state.loader, state.mc);
+  if (res && res.ok) {
+    h.enabled = true;
+    await refreshModsView();
+  }
+  return res;
+}
+
+function mistInstallButton(btn, h) {
+  if (h.enabled) {
+    btn.textContent = '✓ Установлен';
+    btn.disabled = true;
+    return;
+  }
+  btn.textContent = 'Установить';
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const res = await enableMistMod(h);
+    if (res && res.ok) {
+      btn.textContent = '✓ Установлен';
+    } else {
+      btn.disabled = false;
+      els.modsLoaderHint.textContent = 'Ошибка: ' + ((res && res.error) || 'не удалось включить');
+    }
+  });
 }
 
 const CTYPE_POPULAR_TITLES = {
@@ -1432,6 +1478,11 @@ function modmHasVersions() {
 function modmUpdateInstallBtn() {
   const p = modm.project;
   if (!p) return;
+  if (p.mist) {
+    els.modmInstall.textContent = p.enabled ? '✓ Установлен' : '⬇ Установить';
+    els.modmInstall.disabled = !!p.enabled || !p.fileName;
+    return;
+  }
   const v = modm.versions;
   const installed = state.installedIds.has(p.projectId);
   if (!installed) {
@@ -1585,7 +1636,11 @@ async function openModModal(hit) {
   els.modmLinkSep.hidden = true;
   // мгновенно показываем то, что уже знаем из строки списка
   els.modmTitle.textContent = hit.title || hit.slug || '';
-  els.modmDownloads.textContent = hit.downloads ? '⬇ ' + fmtDownloads(hit.downloads) : '';
+  // у своих модов Mist MC нет Modrinth: ни ссылки, ни оценок, ни версий
+  const mist = !!hit.mist;
+  els.modmLink.hidden = mist;
+  els.modmVote.hidden = mist;
+  els.modmDownloads.textContent = mist ? 'мод от Mist MC' : hit.downloads ? '⬇ ' + fmtDownloads(hit.downloads) : '';
   els.modmHint.textContent = '';
   els.modmIcon.replaceChildren(modIcon(hit.iconUrl, hit.title).firstChild || document.createTextNode((hit.title || '?')[0].toUpperCase()));
   els.modmGallery.hidden = true;
@@ -1595,14 +1650,16 @@ async function openModModal(hit) {
   els.modmBody.replaceChildren();
   const loading = document.createElement('div');
   loading.className = 'md-loading';
-  loading.textContent = 'Загружаю описание с Modrinth…';
+  loading.textContent = mist ? 'Загружаю описание…' : 'Загружаю описание с Modrinth…';
   els.modmBody.appendChild(loading);
   modmUpdateInstallBtn();
-  modmRenderVote();
-  loadRatings([hit.projectId]);
+  if (!mist) {
+    modmRenderVote();
+    loadRatings([hit.projectId]);
+  }
   openOverlay(els.modOverlay);
 
-  const res = await window.api.modDetails(hit.slug || hit.projectId);
+  const res = await window.api.modDetails(mist ? hit.projectId : hit.slug || hit.projectId);
   if (token !== modm.token || els.modOverlay.hidden) return; // закрыли/открыли другой
   els.modmBody.replaceChildren();
   if (!res || !res.ok) {
@@ -1612,16 +1669,17 @@ async function openModModal(hit) {
     els.modmBody.appendChild(err);
     return;
   }
-  const p = res.project;
+  const p = mist ? { ...res.project, fileName: hit.fileName, enabled: hit.enabled } : res.project;
   modm.project = p;
   els.modmTitle.textContent = p.title;
-  els.modmDownloads.textContent = '⬇ ' + fmtDownloads(p.downloads);
+  if (!mist) els.modmDownloads.textContent = '⬇ ' + fmtDownloads(p.downloads);
   els.modmIcon.replaceChildren(modIcon(p.iconUrl, p.title).firstChild || document.createTextNode((p.title || '?')[0].toUpperCase()));
   modm.gallery = p.gallery || [];
   modm.idx = 0;
   modmShowImage();
   modmRenderBody();
   modmUpdateInstallBtn();
+  if (mist) return;
   modmRenderVote();
   modmLoadVersions();
 }
@@ -1675,6 +1733,19 @@ els.modmVersion.addEventListener('change', () => {
 els.modmInstall.addEventListener('click', async () => {
   const p = modm.project;
   if (!p || !p.projectId) return;
+  if (p.mist) {
+    els.modmInstall.disabled = true;
+    const res = await enableMistMod(p);
+    if (res && res.ok) {
+      // строка в подборке тоже должна стать «Установлен»
+      for (const h of state.lastHits || []) if (h.projectId === p.projectId) h.enabled = true;
+      renderResults(state.lastHits || []);
+    } else {
+      els.modmHint.textContent = 'Ошибка: ' + ((res && res.error) || 'не удалось включить');
+    }
+    modmUpdateInstallBtn();
+    return;
+  }
   const v = modm.versions;
   const picked = modmHasVersions() ? (els.modmVersion.value || null) : null;
   const installed = state.installedIds.has(p.projectId);

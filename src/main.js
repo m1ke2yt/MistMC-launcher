@@ -454,6 +454,7 @@ function modsResourceDir() {
     remoteModsReady = true;
     remotemods.init(app.getPath('userData'), path.join(resourcesDir(), 'mods'), app.getVersion());
     mods.setOptIn(remotemods.optIn() || []);
+    mods.setMistPages(remotemods.pages());
   }
   return remotemods.dir();
 }
@@ -496,7 +497,10 @@ function refreshBundledInBackground() {
 async function refreshBundledMods(log) {
   modsResourceDir();
   const changed = await remotemods.refresh(log);
-  if (changed) mods.setOptIn(remotemods.optIn() || []);
+  if (changed) {
+    mods.setOptIn(remotemods.optIn() || []);
+    mods.setMistPages(remotemods.pages());
+  }
   return changed;
 }
 function configPath() {
@@ -1980,6 +1984,8 @@ ipcMain.handle('mods-search', async (_e, arg) => {
 ipcMain.handle('mod-details', async (_e, { idOrSlug }) => {
   try {
     const project = await mods.projectDetails(idOrSlug);
+    // страницы своих модов уже на русском
+    if (project.mist) return { ok: true, project: { ...project, bodyRu: null, descriptionRu: null } };
     // полное описание и краткую строку — на русский; null = перевода нет,
     // модалка покажет оригинал (и переключатель не появится)
     const [bodyRu, descriptionRu] = await withTimeout(Promise.all([
@@ -2001,7 +2007,9 @@ ipcMain.handle('mod-details', async (_e, { idOrSlug }) => {
 ipcMain.handle('mods-popular', async (_e, arg) => {
   const { type, loader } = arg;
   try {
-    return { ok: true, hits: await mods.popularContent(type, loader, mcOf(arg)) };
+    const cfgP = loadConfig();
+    const ctx = { gameDir: currentGameDir(), bundledDir: bundledDirOf(cfgP) };
+    return { ok: true, hits: await mods.popularContent(type, loader, mcOf(arg), ctx) };
   } catch (e) {
     return { ok: false, error: 'Modrinth недоступен: ' + e.message, hits: [] };
   }

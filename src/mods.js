@@ -41,7 +41,8 @@ function setOptIn(list) {
 }
 function optInKey(fileName) {
   const f = path.basename(String(fileName));
-  return BUNDLED_OPT_IN.find((k) => f.startsWith(k)) || null;
+  const page = mistForFile(f);
+  return BUNDLED_OPT_IN.find((k) => f.startsWith(k)) || (page ? page.file : null);
 }
 /**
  * Название мода без версии: MistWave-1.1.1+mc26.3.jar → mistwave. По нему
@@ -248,6 +249,7 @@ const BUILTIN_CURATED = {
     { slug: 'clientsort', ru: 'Сортировка инвентаря колёсиком/клавишей' },
     { slug: 'emotecraft', ru: 'Жесты и эмоции — поддерживается на Mist MC' },
     { slug: 'bendable-cuboids', ru: 'Сгибы конечностей для эмоций Emotecraft' },
+    { slug: 'flashback', ru: 'Запись и монтаж роликов; на Mist MC в записи видны модели CPM, эмоции и свои объекты сцены' },
     { slug: 'legacyfreecam', ru: 'Свободная камера: отлететь и посмотреть со стороны' },
     { slug: 'lambdynamiclights', ru: 'Динамический свет: факел светит в руке' },
     { slug: 'litematica', ru: 'Схематика построек: проекция блоков для строительства' },
@@ -292,6 +294,83 @@ const CURATED_TIMEOUT_MS = 5000;
 let curatedFetchedAt = 0;
 let curatedLoading = null;
 let curatedSettled = false; // сайт хоть раз ответил или отказал
+
+// ── свои моды Mist MC в подборке ────────────────────────────────────────
+// Их нет на Modrinth: страница (описание, значок, скриншоты) приходит в списке
+// сборки с зеркала (manifest.pages, см. publish-mods.py), а сам мод — вшитый
+// необязательный джарник, «Установить» его просто включает. Запасной список —
+// mist-pages.json, копия client-mods/pages.json на момент сборки лаунчера.
+const MIST_ID_RE = /^[a-z0-9_-]{2,40}$/;
+const MIST_FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{1,40}$/;
+
+function httpsUrl(u) { return typeof u === 'string' && /^https:\/\//i.test(u) ? u : ''; }
+
+/** Проверенные записи страниц; null — не список. */
+function cleanMist(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const e of list.slice(0, 20)) {
+    if (!e || typeof e.id !== 'string' || !MIST_ID_RE.test(e.id)) continue;
+    if (typeof e.file !== 'string' || !MIST_FILE_RE.test(e.file)) continue;
+    out.push({
+      id: e.id,
+      file: e.file,
+      type: CURATED_TYPES.includes(e.type) ? e.type : 'mod',
+      title: typeof e.title === 'string' && e.title ? e.title.slice(0, 60) : e.id,
+      ru: typeof e.ru === 'string' ? e.ru.slice(0, 200) : '',
+      icon: httpsUrl(e.icon),
+      body: typeof e.body === 'string' ? e.body.slice(0, 20000) : '',
+      gallery: (Array.isArray(e.gallery) ? e.gallery : [])
+        .filter((g) => g && httpsUrl(g.url))
+        .slice(0, 12)
+        .map((g) => ({ url: g.url, title: typeof g.title === 'string' ? g.title.slice(0, 160) : '' })),
+    });
+  }
+  return out;
+}
+const BUILTIN_MIST = (() => {
+  try {
+    return cleanMist(require('./mist-pages.json')) || [];
+  } catch (_) {
+    return [];
+  }
+})();
+let mistPages = BUILTIN_MIST;
+
+/** Страницы с зеркала; null (список не скачан) — запасные из сборки лаунчера. */
+function setMistPages(list) {
+  const c = cleanMist(list);
+  mistPages = c || BUILTIN_MIST;
+}
+function mistForFile(fileName) {
+  const f = path.basename(String(fileName));
+  return mistPages.find((e) => f.startsWith(e.file)) || null;
+}
+
+/** Свои моды для подборки: только те, чей джарник есть в сборке этой версии игры. */
+function mistHits(type, loader, mc, ctx) {
+  if (!ctx || !ctx.bundledDir) return [];
+  const jars = bundledFor(ctx.bundledDir, loader, mc).jars;
+  const m = ctx.gameDir ? readManifest(ctx.gameDir) : null;
+  const out = [];
+  for (const e of mistPages) {
+    if (e.type !== type) continue;
+    const jar = jars.find((f) => f.startsWith(e.file));
+    if (!jar) continue;
+    out.push({
+      mist: true,
+      projectId: 'mist:' + e.id,
+      slug: e.id,
+      title: e.title,
+      description: e.ru,
+      iconUrl: e.icon,
+      downloads: 0,
+      fileName: jar,
+      enabled: m ? bundledOn(m, jar) : false,
+    });
+  }
+  return out;
+}
 
 /** Разбор ответа сайта; тип без годных записей берёт встроенный список. */
 function parseCurated(body) {
@@ -440,12 +519,18 @@ function listContent(gameDir, type, loader, bundledDir, mc = BUNDLED_MC) {
   bundledDirSeen = bundledDir;
   const m = readManifest(gameDir);
   const bundled = type === 'mod'
-    ? bundledFor(bundledDir, loader, mc).jars.map((f) => ({
-        fileName: f,
-        title: f.replace(/\.jar$/i, ''),
-        enabled: bundledOn(m, f),
-        optional: !!optInKey(f),
-      }))
+    ? bundledFor(bundledDir, loader, mc).jars.map((f) => {
+        const page = mistForFile(f);
+        return {
+          fileName: f,
+          title: page ? page.title : f.replace(/\.jar$/i, ''),
+          iconUrl: page ? page.icon : '',
+          mistId: page ? page.id : undefined,
+          description: page ? page.ru : undefined,
+          enabled: bundledOn(m, f),
+          optional: !!optInKey(f),
+        };
+      })
     : [];
   // подчистка: записи, чьи файлы удалили руками (или доудалило отложенное)
   const alive = m.user.filter((e) =>
@@ -605,7 +690,17 @@ async function searchContent(query, type, loader, mcVersion) {
 
 // ── популярные (кураторские подборки) ───────────────────────────────────
 const curatedCache = new Map(); // type -> ответ /projects
-async function popularContent(type, loader, mcVersion) {
+async function popularContent(type, loader, mcVersion, ctx) {
+  const mist = mistHits(type, loader, mcVersion, ctx);
+  try {
+    return mist.concat(await modrinthPopular(type, loader, mcVersion));
+  } catch (e) {
+    if (mist.length) return mist;
+    throw e;
+  }
+}
+
+async function modrinthPopular(type, loader, mcVersion) {
   // ждём сайт только в первый раз (и не дольше таймаута) — дальше подборка
   // обновляется в фоне, а вкладка открывается с тем, что уже есть
   const loading = loadCurated();
@@ -643,6 +738,24 @@ async function popularContent(type, loader, mcVersion) {
 // Кэшируем на сессию — повторное открытие модалки мгновенное.
 const detailsCache = new Map(); // idOrSlug -> project
 async function projectDetails(idOrSlug) {
+  if (String(idOrSlug).startsWith('mist:')) {
+    const e = mistPages.find((x) => 'mist:' + x.id === idOrSlug);
+    if (!e) throw new Error('страница мода не найдена');
+    return {
+      mist: true,
+      projectId: 'mist:' + e.id,
+      slug: e.id,
+      title: e.title,
+      description: e.ru,
+      body: e.body,
+      iconUrl: e.icon,
+      downloads: 0,
+      followers: 0,
+      gallery: e.gallery,
+      gameVersions: [],
+      loaders: [],
+    };
+  }
   if (detailsCache.has(idOrSlug)) return detailsCache.get(idOrSlug);
   const p = await apiGet(API + '/project/' + encodeURIComponent(idOrSlug));
   const gallery = (Array.isArray(p.gallery) ? p.gallery : [])
@@ -2819,6 +2932,7 @@ function collectClientInventory(gameDir, bundledDir, loader, mc = BUNDLED_MC) {
 module.exports = {
   BUNDLED_MC,
   setOptIn,
+  setMistPages,
   modStem,
   hasBundled,
   setLoaderVersion,

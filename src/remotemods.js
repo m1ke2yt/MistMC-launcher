@@ -105,6 +105,11 @@ function dir() {
   return active || builtinDir;
 }
 
+/** Страницы своих модов для подборки (manifest.pages); null — список не скачан. */
+function pages() {
+  return activeManifest && Array.isArray(activeManifest.pages) ? activeManifest.pages : null;
+}
+
 /** Необязательные моды по списку с сайта; null — список не скачан (правило лаунчера). */
 function optIn() {
   return activeManifest && Array.isArray(activeManifest.optIn) ? activeManifest.optIn : null;
@@ -181,7 +186,8 @@ async function doRefresh(log) {
   const { m, base } = await loadList();
   const same = activeManifest && active === cacheDir
     && JSON.stringify(activeManifest.files) === JSON.stringify(m.files)
-    && JSON.stringify(activeManifest.optIn || []) === JSON.stringify(m.optIn || []);
+    && JSON.stringify(activeManifest.optIn || []) === JSON.stringify(m.optIn || [])
+    && JSON.stringify(activeManifest.pages || null) === JSON.stringify(m.pages || null);
   if (same) return false;
   const staging = cacheDir + '.new';
   rmrf(staging);
@@ -241,4 +247,4 @@ function refresh(log) {
   return refreshing;
 }
 
-module.exports = { init, dir, optIn, refresh, validManifest };
+module.exports = { init, dir, optIn, pages, refresh, validManifest };
