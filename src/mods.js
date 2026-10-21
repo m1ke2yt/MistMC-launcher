@@ -800,6 +800,10 @@ async function pickVersion(projectId, type, loader, mcVersion, pinnedVersionId) 
   if (pinnedVersionId) {
     try {
       const v = await apiGet(API + '/version/' + encodeURIComponent(pinnedVersionId));
+      // пин обязан быть версией ЭТОГО проекта: в чужом коде сборки пара
+      // «проект + версия» приходит от автора кода, и версия другого мода
+      // поставилась бы под названием этого. Чужую версию игнорируем
+      if (!v || v.project_id !== projectId) throw new Error('версия другого проекта');
       // пин от другого мода может указывать на сборку под чужую версию игры —
       // такую не берём, иначе джарник не запустится на выбранной
       if (type !== 'mod' || !Array.isArray(v.game_versions) || v.game_versions.includes(mcVersion)) return v;
@@ -2392,24 +2396,73 @@ function exportBuild(gameDir, loader, parts, mc = BUNDLED_MC) {
  * а всё, что заменяем, сперва кладём рядом с пометкой .bak-build, чтобы игрок
  * мог вернуть своё управление.
  */
+/** Файлы из кода сборки: { путь: содержимое }. Битый код или «бомба» при распаковке — ошибка. */
+function readShareMap(build) {
+  if (!build || typeof build.filesGz !== 'string' || !build.filesGz) return {};
+  // распакованное больше SHARE_MAX_RAW с запасом не собирает ни один лаунчер
+  const raw = zlib.gunzipSync(Buffer.from(build.filesGz, 'base64'), { maxOutputLength: SHARE_MAX_RAW * 2 });
+  const map = JSON.parse(raw.toString('utf8'));
+  return map && typeof map === 'object' && !Array.isArray(map) ? map : {};
+}
+
+/** Куда ляжет файл из чужого кода: { cat, dest } или null — файл не берём ни под какой галочкой. */
+function shareTarget(gameDir, rel, content) {
+  const cat = shareCategory(rel);
+  if (!cat || typeof content !== 'string') return null;
+  // чужой токен не должен лечь поверх своего (и не должен вообще)
+  if (sharePrivate(rel, content)) return null;
+  const dest = path.join(gameDir, rel.replace(/\//g, path.sep));
+  // финальная страховка: результат обязан остаться внутри папки игры
+  if (!path.resolve(dest).startsWith(path.resolve(gameDir) + path.sep)) return null;
+  return { cat, dest };
+}
+
+/**
+ * Что из настроек чужого кода реально ляжет в папку игры — считаем сами по
+ * содержимому кода тем же отбором, что и при установке. Сводке filesInfo из
+ * кода не верим: её пишет автор кода, и «0 файлов» могло прятать замену
+ * управления. paths — первые SHARE_PREVIEW_PATHS путей, replace — заменят свой файл.
+ */
+const SHARE_PREVIEW_PATHS = 40;
+function shareFilesInfo(gameDir, build) {
+  const info = { configs: 0, options: false, shaders: 0, bytes: 0, total: 0, replace: 0, skipped: 0, paths: [], broken: false };
+  let map;
+  try {
+    map = readShareMap(build);
+  } catch (_) {
+    info.broken = true;
+    return info;
+  }
+  for (const [rel, content] of Object.entries(map)) {
+    const t = shareTarget(gameDir, rel, content);
+    if (!t) { info.skipped++; continue; }
+    const replace = fs.existsSync(t.dest);
+    info.total++;
+    info.bytes += Buffer.byteLength(content, 'utf8');
+    if (replace) info.replace++;
+    if (t.cat === 'configs') info.configs++;
+    else if (t.cat === 'shaders') info.shaders++;
+    else if (t.cat === 'options') info.options = true;
+    if (info.paths.length < SHARE_PREVIEW_PATHS) info.paths.push({ path: rel, cat: t.cat, replace });
+  }
+  return info;
+}
+
 function applyShareFiles(gameDir, build, parts, log) {
   const res = { written: 0, skipped: 0, backedUp: 0 };
   if (!build || !build.filesGz) return res;
   let map;
   try {
-    map = JSON.parse(zlib.gunzipSync(Buffer.from(build.filesGz, 'base64')).toString('utf8'));
+    map = readShareMap(build);
   } catch (e) {
     log('  ! настройки в коде повреждены: ' + e.message);
     return res;
   }
   for (const [rel, content] of Object.entries(map)) {
-    const cat = shareCategory(rel);
-    if (!cat || !parts || !parts[cat] || typeof content !== 'string') { res.skipped++; continue; }
-    // чужой токен не должен лечь поверх своего (и не должен вообще)
-    if (sharePrivate(rel, content)) { res.skipped++; continue; }
-    const dest = path.join(gameDir, rel.replace(/\//g, path.sep));
-    // финальная страховка: результат обязан остаться внутри папки игры
-    if (!path.resolve(dest).startsWith(path.resolve(gameDir) + path.sep)) { res.skipped++; continue; }
+    const t = shareTarget(gameDir, rel, content);
+    // берём только то, что игрок отметил сам: галочка — строго true
+    if (!t || !parts || parts[t.cat] !== true) { res.skipped++; continue; }
+    const { dest } = t;
     try {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       if (fs.existsSync(dest)) {
@@ -2430,28 +2483,91 @@ function applyShareFiles(gameDir, build, parts, log) {
   return res;
 }
 
+// id или slug проекта Modrinth; всё прочее в коде сборки — мусор
+const MODRINTH_KEY_RE = /^[A-Za-z0-9_.-]{2,64}$/;
+const BUILD_MAX_ITEMS = 300;
+
+/**
+ * Позиции чужого кода сборки — по данным самого Modrinth. Название, значок и
+ * тип из кода не берём: их пишет автор кода, и «Sodium» в нём мог оказаться
+ * чем угодно. Чего каталог не знает, помечаем known: false — такое не ставим.
+ * Возвращает [{ key, known, projectId, slug, title, iconUrl, type, versionId }].
+ */
+async function resolveBuildItems(items) {
+  const list = (Array.isArray(items) ? items : []).filter((it) => it && typeof it === 'object').slice(0, BUILD_MAX_ITEMS);
+  const keyOf = (it) => (typeof it.projectId === 'string' && MODRINTH_KEY_RE.test(it.projectId) ? it.projectId : null);
+  const keys = [...new Set(list.map(keyOf).filter(Boolean))];
+  const byKey = new Map();
+  for (let i = 0; i < keys.length; i += 80) {
+    const ps = await apiGet(API + '/projects?ids=' + encodeURIComponent(JSON.stringify(keys.slice(i, i + 80))));
+    for (const p of Array.isArray(ps) ? ps : []) {
+      if (!p || typeof p.id !== 'string') continue;
+      byKey.set(p.id, p);
+      if (typeof p.slug === 'string') byKey.set(p.slug, p);
+    }
+  }
+  return list.map((it) => {
+    const key = keyOf(it);
+    const p = key ? byKey.get(key) : null;
+    // тип — по каталогу: модпак или датапак под видом «мода» не ставим
+    if (!p || !TYPES[p.project_type]) {
+      return { key: key || '', known: false, projectId: null, slug: '', title: '', iconUrl: '', type: null, versionId: null };
+    }
+    return {
+      key,
+      known: true,
+      projectId: p.id,
+      slug: p.slug || p.id,
+      title: p.title || p.slug || p.id,
+      iconUrl: httpsUrl(p.icon_url),
+      type: p.project_type,
+      // пин версии — только подсказка: pickVersion примет его, лишь если это
+      // версия того же проекта
+      versionId: typeof it.versionId === 'string' && MODRINTH_KEY_RE.test(it.versionId) ? it.versionId : null,
+    };
+  });
+}
+
+/** Подпись позиции, которой нет в каталоге: id из кода как есть, без «названия» автора кода. */
+function unknownItemLabel(r) {
+  return r.key ? 'неизвестный проект «' + r.key + '»' : 'повреждённая запись';
+}
+
+/**
+ * Что покажем ДО установки: позиции (по каталогу Modrinth) и файлы настроек,
+ * посчитанные по самому коду. Modrinth недоступен — бросает: показывать
+ * непроверенный список нельзя.
+ */
+async function previewBuild(gameDir, build) {
+  const items = await resolveBuildItems(build && build.items);
+  return { items, files: shareFilesInfo(gameDir, build) };
+}
+
 async function applyBuild(gameDir, build, mcVersion, log, parts) {
   const loader = build && build.loader === 'forge' ? 'forge' : 'fabric';
-  const items = Array.isArray(build && build.items) ? build.items : [];
   // сборку делали под другую версию игры: точные версии модов к нашей не
   // подойдут — ставим те же моды, но в сборках под выбранную версию
   const buildMc = (build && typeof build.mc === 'string' && build.mc) || BUNDLED_MC;
   const sameMc = buildMc === mcVersion;
   const summary = { installed: [], already: [], failed: [], loader, files: null, buildMc, sameMc };
   if (!sameMc) log('ⓘ Сборка собрана под Minecraft ' + buildMc + ' — подбираю эти же моды под ' + mcVersion);
-  for (const it of items) {
-    if (!it || !it.projectId) continue;
-    const type = TYPES[it.type] ? it.type : 'mod';
+  const resolved = await resolveBuildItems(build && build.items);
+  for (const r of resolved) {
+    if (!r.known) {
+      summary.failed.push(unknownItemLabel(r) + ': нет в каталоге Modrinth');
+      log('  ! ' + unknownItemLabel(r) + ': нет в каталоге Modrinth — пропускаю');
+      continue;
+    }
     try {
       const res = await installContent(
         gameDir,
-        { projectId: it.projectId, slug: it.slug, title: it.title, iconUrl: it.iconUrl || '' },
-        type, loader, mcVersion, log, 0, (sameMc || type !== 'mod') ? (it.versionId || null) : null,
+        { projectId: r.projectId, slug: r.slug, title: r.title, iconUrl: r.iconUrl },
+        r.type, loader, mcVersion, log, 0, (sameMc || r.type !== 'mod') ? r.versionId : null,
       );
-      if (res && res.ok) (res.already ? summary.already : summary.installed).push(it.title || it.slug);
-      else summary.failed.push((it.title || it.slug) + ': ' + ((res && res.error) || '?'));
+      if (res && res.ok) (res.already ? summary.already : summary.installed).push(r.title);
+      else summary.failed.push(r.title + ': ' + ((res && res.error) || '?'));
     } catch (e) {
-      summary.failed.push((it.title || it.slug) + ': ' + e.message);
+      summary.failed.push(r.title + ': ' + e.message);
     }
   }
   // после массовой установки приводим версии в согласие (см. enforceJarDeps)
@@ -2514,6 +2630,42 @@ async function projectsById(ids) {
   return out;
 }
 
+/** Владельцы проектов по их командам Modrinth: { teamId: ник }. Не ответил каталог — пусто. */
+async function teamOwners(teamIds) {
+  const out = {};
+  const ids = [...new Set(teamIds.filter((t) => typeof t === 'string' && MODRINTH_KEY_RE.test(t)))];
+  for (let i = 0; i < ids.length; i += 80) {
+    try {
+      const teams = await apiGet(API + '/teams?ids=' + encodeURIComponent(JSON.stringify(ids.slice(i, i + 80))));
+      for (const members of Array.isArray(teams) ? teams : []) {
+        if (!Array.isArray(members) || !members.length) continue;
+        const owner = members.find((m) => m && /owner/i.test(String(m.role || ''))) || members[0];
+        const name = owner && owner.user && owner.user.username;
+        if (owner && typeof owner.team_id === 'string' && typeof name === 'string') out[owner.team_id] = name;
+      }
+    } catch (_) { /* авторов не узнали — журнал обойдётся без них */ }
+  }
+  return out;
+}
+
+/**
+ * Строка журнала на каждый мод, поставленный для мира друга: название, slug,
+ * версия и автор — как их знает Modrinth. Если друг назвал мод иначе, это
+ * тоже видно: подпись приходит из чужой игры.
+ */
+async function logFriendInstalls(list, log) {
+  if (!list.length) return;
+  const owners = await teamOwners(list.map((x) => x.project.team));
+  for (const { asked, project, version, already } of list) {
+    const who = owners[project.team];
+    const title = project.title || project.slug;
+    log('  ✓ для мира друга' + (already ? ' (уже был)' : '') + ': ' + title
+      + ' [modrinth.com/mod/' + (project.slug || project.id) + '] ' + (version.version_number || '')
+      + (who ? ', автор ' + who : '')
+      + (asked && asked !== title ? ' — у друга подписан «' + asked + '»' : ''));
+  }
+}
+
 /**
  * Мод, которого нет в каталоге по хэшу (друг скачал его не с Modrinth или
  * файл пересобран): ищем проект, названный как fabric-id мода, и берём сборку
@@ -2564,6 +2716,7 @@ function disabledBundled(gameDir, loader, mc, modId) {
 async function installForFriend(gameDir, loader, mc, wanted, log, onProgress) {
   const installed = [];
   const failed = [];
+  const fromCatalog = []; // [{ asked, project, version, already }] — для журнала
   const step = (i, name) => { try { onProgress(i, wanted.length, name); } catch (_) { /* игра ушла */ } };
   if (loader !== 'fabric') {
     return { installed, failed: wanted.map((w) => ({ name: w.name, why: 'игра запущена без Fabric' })) };
@@ -2583,11 +2736,13 @@ async function installForFriend(gameDir, loader, mc, wanted, log, onProgress) {
     step(i, w.name);
     try {
       // выключенный самим игроком — включаем обратно, качать нечего
+      // в отчёт идут свои названия (джарник сборки, запись лаунчера), а не
+      // те, что прислал друг: его «name» — просто подпись из чужой игры
       const bundledOff = disabledBundled(gameDir, loader, mc, w.id);
       if (bundledOff) {
         toggleBundledMod(gameDir, bundledOff, true);
         log('  + ' + bundledOff + ' включён обратно: нужен для мира друга');
-        installed.push(w.name);
+        installed.push(bundledOff);
         continue;
       }
       const off = disabledProvider(gameDir, loader, mc, w.id);
@@ -2595,7 +2750,7 @@ async function installForFriend(gameDir, loader, mc, wanted, log, onProgress) {
         const r = toggleUserContent(gameDir, 'mod', off.fileName, true);
         if (r.ok) {
           log('  + ' + off.title + ' включён обратно: нужен для мира друга');
-          installed.push(w.name);
+          installed.push(off.title || off.fileName);
           continue;
         }
       }
@@ -2623,14 +2778,18 @@ async function installForFriend(gameDir, loader, mc, wanted, log, onProgress) {
         iconUrl: project.icon_url || '',
         description: project.description || '',
       }, 'mod', loader, mc, log, 0, version.id, { deferDeps: true });
-      if (r && r.ok) installed.push(w.name);
-      else failed.push({ name: w.name, why: (r && r.error) || 'не установился' });
+      if (r && r.ok) {
+        // что встало на самом деле — по каталогу: проект и версия с Modrinth
+        installed.push(project.title || project.slug);
+        fromCatalog.push({ asked: w.name, project, version, already: !!r.already });
+      } else failed.push({ name: w.name, why: (r && r.error) || 'не установился' });
     } catch (e) {
       failed.push({ name: w.name, why: 'не скачался: ' + (e && e.message ? e.message : 'ошибка сети') });
       log('  ! ' + w.name + ': ' + (e && e.message ? e.message : e));
     }
   }
   step(wanted.length, '');
+  await logFriendInstalls(fromCatalog, log);
   // требования новых модов друг к другу и к уже стоящим — один раз на всю пачку
   if (installed.length) {
     try { await enforceJarDeps(gameDir, loader, mc, log); } catch (_) { /* доделает проверка перед запуском */ }
@@ -2987,8 +3146,12 @@ module.exports = {
   enforceJarDeps,
   collectClientInventory,
   exportBuild,
+  previewBuild,
   applyBuild,
   sharePrivate,
+  shareFilesInfo,
+  resolveBuildItems,
+  pickVersion,
   readZipEntry,
   jarModInfo,
   adoptContent,

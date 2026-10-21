@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const dns = require('dns');
+const crypto = require('crypto');
 
 // Версия сервера Mist MC: под неё вшитая сборка модов, она же выбрана по умолчанию
 const SERVER_MC = '1.21.11';
@@ -19,6 +20,10 @@ const FORGE_PINNED = { '1.21.11': '61.1.0' };
 const FORGE_PROMOS_URL = 'https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json';
 // Вшитая в лаунчер Java. Версиям игры новее нужна своя — её качаем у Mojang
 const BUNDLED_JAVA_MAJOR = 21;
+// Индекс рантаймов — корень доверия для Java: в нём sha1 описи файлов, а в
+// описи — sha1 каждого файла. Хэш в адресе — id продукта, а не sha1 индекса,
+// сверить индекс не с чем. Поэтому зеркало — последним: если индекс отдал
+// он, подлинность Java держится на честности bmclapi.
 const JAVA_INDEX_URLS = [
   'https://piston-meta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json',
   'https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json',
@@ -48,6 +53,32 @@ async function fetchJsonAny(urls, dispatcher, timeoutMs = 20000) {
       const res = await ctx.fetch(url, { dispatcher, signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return await res.json();
+    } catch (e) {
+      last = e;
+    }
+  }
+  throw last || new Error('нет адресов');
+}
+
+/**
+ * JSON по первому адресу, чей sha1 совпал с ожидаемым. Подменённый или битый
+ * ответ зеркала отсеиваем и идём к следующему адресу; без sha1 не качаем.
+ */
+async function fetchJsonVerified(urls, sha1, dispatcher, timeoutMs = 20000) {
+  const want = String(sha1 || '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(want)) throw new Error('нет sha1 для проверки');
+  let last = null;
+  for (const url of urls) {
+    try {
+      const res = await ctx.fetch(url, { dispatcher, signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const got = crypto.createHash('sha1').update(buf).digest('hex');
+      if (got !== want) {
+        ctx.log('ⓘ ' + new URL(url).host + ' отдал файл с чужим sha1 — пропускаю');
+        throw new Error('sha1 не совпал');
+      }
+      return JSON.parse(buf.toString('utf8'));
     } catch (e) {
       last = e;
     }
@@ -234,6 +265,97 @@ async function quiltLoaderVersion(dispatcher) {
   return readCache('quilt-loader.json');
 }
 
+// ── профиль Fabric ──────────────────────────────────────────────────────
+// Профиль «<игра>-fabric<loader>» с меты Fabric (а при её недоступности — с
+// зеркала bmclapi) задаёт главный класс, JVM-флаги и откуда качать библиотеки,
+// то есть что именно запустится. Подменённый профиль — готовый запуск чужого
+// кода, поэтому принимаем только тот вид, что отдаёт сама мета Fabric.
+const FABRIC_MAIN_CLASS = 'net.fabricmc.loader.impl.launch.knot.KnotClient';
+const FABRIC_PROFILE_KEYS = new Set(['id', 'inheritsFrom', 'releaseTime', 'time', 'type', 'mainClass', 'arguments', 'libraries']);
+const FABRIC_LIB_KEYS = new Set(['name', 'url', 'md5', 'sha1', 'sha256', 'sha512', 'size', 'checksums']);
+// единственный JVM-флаг профиля: точка входа игры для модов, которые её проверяют
+const FABRIC_JVM_ARG = /^-DFabricMcEmu=\s*net\.minecraft\.client\.main\.Main\s*$/;
+const FABRIC_LIB_NAME = /^(net\.fabricmc|org\.ow2\.asm):[A-Za-z0-9._-]+:[A-Za-z0-9._+-]+$/;
+const FABRIC_MAVEN = 'https://maven.fabricmc.net/';
+const SHA1_RE = /^[0-9a-f]{40}$/i;
+
+/** Что не так с профилем Fabric (строка) или null — профиль как с меты Fabric. */
+function fabricProfileProblem(json, mcVersion, loaderVersion) {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return 'не объект';
+  for (const k of Object.keys(json)) if (!FABRIC_PROFILE_KEYS.has(k)) return 'лишнее поле ' + k;
+  if (json.mainClass !== FABRIC_MAIN_CLASS) return 'чужой mainClass';
+  if (json.inheritsFrom !== mcVersion) return 'не та версия игры';
+  const args = json.arguments;
+  if (args !== undefined) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return 'кривые arguments';
+    for (const k of Object.keys(args)) if (k !== 'game' && k !== 'jvm') return 'лишние arguments.' + k;
+    if (args.game !== undefined && !(Array.isArray(args.game) && args.game.length === 0)) return 'аргументы игры';
+    if (args.jvm !== undefined) {
+      if (!Array.isArray(args.jvm)) return 'кривые JVM-аргументы';
+      for (const a of args.jvm) if (typeof a !== 'string' || !FABRIC_JVM_ARG.test(a)) return 'чужой JVM-аргумент';
+    }
+  }
+  if (!Array.isArray(json.libraries) || !json.libraries.length) return 'нет библиотек';
+  let hasLoader = false;
+  for (const lib of json.libraries) {
+    if (!lib || typeof lib !== 'object') return 'кривая библиотека';
+    for (const k of Object.keys(lib)) if (!FABRIC_LIB_KEYS.has(k)) return 'лишнее поле библиотеки ' + k;
+    if (typeof lib.name !== 'string' || !FABRIC_LIB_NAME.test(lib.name)) return 'чужая библиотека ' + String(lib.name).slice(0, 80);
+    if (lib.url !== FABRIC_MAVEN) return 'библиотека не с maven.fabricmc.net';
+    if (lib.sha1 !== undefined && !(typeof lib.sha1 === 'string' && SHA1_RE.test(lib.sha1))) return 'кривой sha1';
+    if (lib.checksums !== undefined && !(Array.isArray(lib.checksums) && lib.checksums.length === 1
+        && lib.checksums[0] === lib.sha1)) return 'кривые checksums';
+    if (lib.name === 'net.fabricmc:fabric-loader:' + loaderVersion) hasLoader = true;
+  }
+  if (!hasLoader) return 'нет fabric-loader ' + loaderVersion;
+  return null;
+}
+
+/** Путь библиотеки в maven-репозитории по имени group:artifact:version. */
+function mavenPath(name) {
+  const [group, artifact, version] = String(name).split(':');
+  return group.replace(/\./g, '/') + '/' + artifact + '/' + version + '/' + artifact + '-' + version + '.jar';
+}
+
+/**
+ * sha1 библиотек — в виде, который проверяет xmcl. Поле sha1 профиля xmcl не
+ * читает (берёт checksums[0]), и библиотеки Fabric без него качались первым
+ * же ответившим хостом из mavenHost — то есть и зеркалом — вообще без сверки.
+ * Где можно, sha1 берём с самого maven.fabricmc.net: так сверяется и профиль
+ * с зеркала. Maven не ответил — остаётся sha1 из профиля (у fabric-loader и
+ * intermediary его в профиле нет — они тогда без сверки, как раньше).
+ * Расхождение sha1 профиля с maven — подмена: бросаем.
+ */
+async function fabricLibChecksums(json, dispatcher, timeoutMs = 8000) {
+  await Promise.all(json.libraries.map(async (lib) => {
+    try {
+      const res = await ctx.fetch(FABRIC_MAVEN + mavenPath(lib.name) + '.sha1', { dispatcher, signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) return;
+      const sha1 = String(await res.text()).trim().split(/\s+/)[0].toLowerCase();
+      if (!SHA1_RE.test(sha1)) return;
+      if (lib.sha1 && lib.sha1.toLowerCase() !== sha1) {
+        throw Object.assign(new Error('sha1 ' + lib.name + ' в профиле не совпал с maven.fabricmc.net'), { tampered: true });
+      }
+      lib.sha1 = sha1;
+    } catch (e) {
+      if (e && e.tampered) throw e;
+      /* maven недоступен — остаёмся с тем, что в профиле */
+    }
+  }));
+  return withLibChecksums(json);
+}
+
+/** checksums из sha1 профиля (без сети) — для профилей, сохранённых до проверки. */
+function withLibChecksums(json) {
+  for (const lib of json.libraries) {
+    if (lib.sha1 && SHA1_RE.test(lib.sha1)) {
+      lib.sha1 = lib.sha1.toLowerCase();
+      lib.checksums = [lib.sha1];
+    }
+  }
+  return json;
+}
+
 // ── Java ────────────────────────────────────────────────────────────────
 function javaExeName() { return process.platform === 'win32' ? 'javaw.exe' : 'java'; }
 function runtimeDir(component) { return path.join(ctx.dataDir, 'runtime', component); }
@@ -283,16 +405,33 @@ async function ensureJava({ versionJson, bundledJava, installer, dl, runTask }) 
     throw new Error('Для этой системы нет Java ' + major + ' — Minecraft ' + ((versionJson && versionJson.id) || '')
       + ' на ней не запустится. Выберите другую версию игры.');
   }
-  const manifest = await fetchJsonAny(withMirror(target.manifest.url), dl.dispatcher);
+  // опись файлов сверяем с sha1 из индекса: с зеркала она могла прийти
+  // подменённой, а по ней xmcl проверяет каждый файл (sha1 файлов — из описи)
+  let manifest;
+  try {
+    manifest = await fetchJsonVerified(withMirror(target.manifest.url), target.manifest && target.manifest.sha1, dl.dispatcher);
+  } catch (e) {
+    throw new Error('Не удалось скачать список файлов Java ' + major + ': ' + ((e && e.message) || e));
+  }
   if (!manifest || !manifest.files) throw new Error('Mojang отдал пустой список файлов Java');
 
   const dest = runtimeDir(component);
+  // пути из описи обязаны остаться внутри папки рантайма (ссылки — тоже)
+  const inside = (p) => path.resolve(p).startsWith(path.resolve(dest) + path.sep);
+  for (const [file, entry] of Object.entries(manifest.files)) {
+    const full = path.join(dest, file);
+    if (!inside(full) || (entry && entry.type === 'link' && !inside(path.join(path.dirname(full), String(entry.target))))) {
+      throw new Error('В списке файлов Java путь за пределами папки: ' + file);
+    }
+  }
   fs.mkdirSync(dest, { recursive: true });
   try { fs.unlinkSync(runtimeMarker(component)); } catch (_) { /* маркера ещё нет */ }
   await runTask('Загрузка Java ' + major + ' (нужна один раз)', installer.installJavaRuntimeTask({
     destination: dest,
     manifest: { files: manifest.files, target: component, version: target.version },
-    // файлы лежат на piston-data; запасным — зеркало с тем же путём
+    // файлы лежат на piston-data; запасным — зеркало с тем же путём. Каждый
+    // файл xmcl сверяет с sha1 из описи (validator в downloadFiles), так что
+    // подмена на зеркале упирается в уже проверенную опись
     apiHost: ['piston-data.mojang.com', 'bmclapi2.bangbang93.com'],
     dispatcher: dl.dispatcher,
   }));
@@ -425,6 +564,9 @@ module.exports = {
   serverAccepts,
   pingServer,
   withMirror,
+  fabricProfileProblem,
+  fabricLibChecksums,
+  withLibChecksums,
   // чистые функции — наружу для тестов
   releasesFromManifest,
   forgeFromPromos,

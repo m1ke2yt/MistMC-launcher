@@ -255,6 +255,11 @@ async function mojangSessionJvmArgs() {
 // (живой кейс 30.08). Качаем сами: официальный хост → зеркало bmclapi →
 // кэш последнего удачного ответа. Кэш даёт уже установленным игрокам
 // запускаться вообще без доступа к Mojang.
+// Предел проверки: манифест — корень доверия всей цепочки. xmcl сверяет
+// version.json с sha1 из адреса в манифесте, а client.jar, библиотеки и индекс
+// ассетов — с sha1 из version.json. Сам манифест сверить не с чем; если его
+// отдал bmclapi (или он лёг в кэш оттуда), подлинность игры держится на
+// честности зеркала.
 const VERSION_MANIFEST_URLS = [
   'https://launchermeta.mojang.com/mc/game/version_manifest.json',
   'https://bmclapi2.bangbang93.com/mc/game/version_manifest.json',
@@ -319,17 +324,35 @@ function isFabricProfile(json) {
 // меты при КАЖДОМ запуске, одним хостом и мимо dispatcher — без меты не
 // запускалась и уже установленная игра. Профиль пары «игра + loader» не
 // меняется, поэтому лежащий на диске берём без сети.
+// Профиль (и сохранённый, и свежий) проверяем versions.fabricProfileProblem:
+// с зеркала мог прийти чужой mainClass, JVM-флаг или библиотека не с Fabric.
 async function installFabricProfile(mcVersion, loaderVersion, folder, dispatcher) {
   const versionName = mcVersion + '-fabric' + loaderVersion;
   const jsonPath = folder.getVersionJson(versionName);
   try {
     const saved = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-    if (saved.id === versionName && saved.inheritsFrom === mcVersion && isFabricProfile(saved)) return versionName;
+    if (saved.id === versionName && saved.inheritsFrom === mcVersion && isFabricProfile(saved)) {
+      const problem = versions.fabricProfileProblem(saved, mcVersion, loaderVersion);
+      if (!problem) {
+        // сохранённые до проверки профили — без checksums: дописываем из их sha1
+        if (saved.libraries.some((l) => l.sha1 && !l.checksums)) {
+          fs.writeFileSync(jsonPath, JSON.stringify(versions.withLibChecksums(saved)));
+        }
+        return versionName;
+      }
+      logLine('ⓘ Сохранённый профиль Fabric отклонён (' + problem + ') — качаю заново');
+    }
   } catch (_) { /* профиля ещё нет или он битый — качаем */ }
-  const content = await fetchFabricMeta(
+  let content = await fetchFabricMeta(
     '/v2/versions/loader/' + encodeURIComponent(mcVersion) + '/' + encodeURIComponent(loaderVersion) + '/profile/json',
     dispatcher, 20000);
   if (!isFabricProfile(content)) throw new Error('Мета Fabric вернула не профиль версии');
+  const problem = versions.fabricProfileProblem(content, mcVersion, loaderVersion);
+  if (problem) {
+    logLine('✖ Профиль Fabric не прошёл проверку: ' + problem);
+    throw new Error('Мета Fabric вернула подозрительный профиль (' + problem + ') — запуск остановлен');
+  }
+  content = await versions.fabricLibChecksums(content, dispatcher);
   content.id = versionName;
   fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
   fs.writeFileSync(jsonPath, JSON.stringify(content));
@@ -2240,26 +2263,42 @@ ipcMain.handle('build-share', async (_e, arg) => {
 let pendingBuild = null;
 const normCode = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
+// Что в коде, показываем по данным Modrinth и по самим файлам кода: названия,
+// значки и сводку filesInfo пишет автор кода, им не верим.
 ipcMain.handle('build-preview', async (_e, { code }) => {
   const res = await community.fetchBuild(code);
   if (!res.ok) return res;
+  let pv;
+  try {
+    pv = await mods.previewBuild(currentGameDir(), res.build);
+  } catch (e) {
+    return { ok: false, error: 'Modrinth недоступен — не могу проверить, что в коде (' + e.message + ')' };
+  }
   pendingBuild = { code: normCode(res.code), author: res.author, build: res.build };
+  const files = pv.files;
   return {
     ok: true,
     code: res.code,
     author: res.author,
-    items: (res.build && Array.isArray(res.build.items) ? res.build.items.length : 0),
-    filesInfo: (res.build && res.build.filesInfo) || null,
+    items: pv.items.length,
+    list: pv.items.map((r) => ({ known: r.known, key: r.key, title: r.title, slug: r.slug, type: r.type })),
+    filesInfo: files.total || files.broken ? files : null,
   };
 });
 
 ipcMain.handle('build-apply', async (_e, arg) => {
-  const { code, parts } = arg;
+  const { code } = arg;
+  // настройки — только из кода, который игрок видел в предпросмотре, и только
+  // отмеченные им галочки (строго true); без предпросмотра — одни моды
+  let parts = arg.parts && typeof arg.parts === 'object'
+    ? { configs: arg.parts.configs === true, options: arg.parts.options === true, shaders: arg.parts.shaders === true }
+    : null;
   let data = pendingBuild && pendingBuild.code === normCode(code) ? pendingBuild : null;
   if (!data) {
     const res = await community.fetchBuild(code);
     if (!res.ok) return res;
     data = { code: normCode(res.code), author: res.author, build: res.build };
+    parts = null;
   }
   try {
     status('Применяю сборку…');

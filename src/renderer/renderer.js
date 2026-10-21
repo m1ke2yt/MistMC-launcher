@@ -99,8 +99,16 @@ if (!window.api) {
     skinReset: async () => ({ ok: false, error: 'предпросмотр' }),
     buildShare: async () => ({ ok: true, code: 'K7M2QP', reused: false,
       filesInfo: { configs: 12, options: true, shaders: 1, bytes: 40000 } }),
-    buildPreview: async () => ({ ok: true, code: 'K7M2QP', author: 'M1ke2', items: 5,
-      filesInfo: { configs: 12, options: true, shaders: 1, bytes: 40000 } }),
+    buildPreview: async () => ({ ok: true, code: 'K7M2QP', author: 'M1ke2', items: 3,
+      list: [
+        { known: true, key: 'AANobbMI', title: 'Sodium', slug: 'sodium', type: 'mod' },
+        { known: true, key: 'YL57xq9U', title: 'Iris Shaders', slug: 'iris', type: 'mod' },
+        { known: false, key: 'zzzzzzzz', title: '', slug: '', type: null },
+      ],
+      filesInfo: { configs: 2, options: true, shaders: 0, bytes: 40000, total: 3, replace: 1, skipped: 0,
+        paths: [{ path: 'config/sodium-options.json', cat: 'configs', replace: false },
+          { path: 'config/iris.properties', cat: 'configs', replace: false },
+          { path: 'options.txt', cat: 'options', replace: true }] } }),
     buildApply: async () => ({ ok: false, error: 'предпросмотр' }),
     modDetails: async () => ({
       ok: true,
@@ -723,6 +731,8 @@ function setContentType(ctype) {
 function modIcon(url, title) {
   const wrap = document.createElement('div');
   wrap.className = 'mod-icon';
+  // значки модов — только https: адрес мог прийти из чужого кода сборки
+  if (typeof url !== 'string' || !/^https:\/\//i.test(url)) url = '';
   if (url) {
     const img = document.createElement('img');
     img.src = url;
@@ -4308,6 +4318,35 @@ init();
     return parts.join(' · ') || 'пусто';
   }
 
+  const TYPE_RU = { mod: 'мод', resourcepack: 'ресурспак', shader: 'шейдер' };
+  /**
+   * Что поставится и какие файлы заменятся — до установки. Названия — с
+   * Modrinth (их подставил лаунчер), пути — из самого кода.
+   */
+  function describePreview(pv) {
+    const list = Array.isArray(pv.list) ? pv.list : [];
+    const known = list.filter((r) => r.known);
+    const unknown = list.filter((r) => !r.known);
+    const lines = [];
+    if (known.length) {
+      lines.push('Поставится с Modrinth (' + known.length + '):');
+      for (const r of known) lines.push('• ' + r.title + ' — ' + (TYPE_RU[r.type] || r.type) + ', ' + r.slug);
+    }
+    if (unknown.length) {
+      lines.push('✖ нет в каталоге Modrinth, не поставится: ' + unknown.map((r) => r.key || '?').join(', '));
+    }
+    const fi = pv.filesInfo;
+    if (fi && fi.broken) lines.push('✖ настройки в коде повреждены — не применятся');
+    if (fi && fi.total) {
+      if (lines.length) lines.push('');
+      lines.push('Файлы настроек в коде: ' + fi.total + (fi.replace ? ', заменят твои: ' + fi.replace : '')
+        + '. Возьмём только отмеченное ниже:');
+      for (const p of fi.paths || []) lines.push('  ' + p.path + (p.replace ? ' — заменит' : ''));
+      if (fi.total > (fi.paths || []).length) lines.push('  … и ещё ' + (fi.total - fi.paths.length));
+    }
+    return lines.join('\n') || 'в сборке нечего ставить';
+  }
+
   makeBtn.addEventListener('click', async () => {
     makeBtn.disabled = true;
     makeBtn.textContent = 'Создаю…';
@@ -4358,6 +4397,7 @@ init();
     if (previewed && previewed !== applyInput.value.trim().toUpperCase()) {
       previewed = null;
       partsBox.hidden = true;
+      resultsBox.hidden = true; // список был от прошлого кода
       applyBtn.textContent = 'Применить';
       applyHint.textContent = 'Доставим недостающие моды. Твои моды не удалятся.';
     }
@@ -4380,15 +4420,20 @@ init();
       }
       previewed = code.toUpperCase();
       applyHint.textContent = 'Сборка игрока ' + pv.author + ': ' + describeBuild(pv.items, pv.filesInfo);
-      if (pv.filesInfo) {
+      // чужие настройки — только по галочке, которую игрок поставил сам
+      for (const id of ['apply-configs', 'apply-options', 'apply-shaders']) $(id).checked = false;
+      const fi = pv.filesInfo;
+      partsBox.hidden = !(fi && fi.total);
+      if (fi && fi.total) {
         // показываем только те галочки, что реально есть в коде
-        partsBox.hidden = false;
-        $('apply-configs').closest('.checkbox').hidden = !pv.filesInfo.configs;
-        $('apply-options').closest('.checkbox').hidden = !pv.filesInfo.options;
-        $('apply-shaders').closest('.checkbox').hidden = !pv.filesInfo.shaders;
-        applyBtn.textContent = 'Установить';
-        return; // второй клик — установка
+        $('apply-configs').closest('.checkbox').hidden = !fi.configs;
+        $('apply-options').closest('.checkbox').hidden = !fi.options;
+        $('apply-shaders').closest('.checkbox').hidden = !fi.shaders;
       }
+      resultsBox.hidden = false;
+      resultsBox.textContent = describePreview(pv);
+      applyBtn.textContent = 'Установить';
+      return; // второй клик — установка, после того как игрок увидел список
     }
 
     applyBtn.disabled = true;

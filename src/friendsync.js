@@ -13,9 +13,12 @@
 //   игра → { t: 'sync', host, mc, mods: [{ id, n, v, h }] }
 //   лаунчер → { t: 'progress', done, total, name } … { t: 'result', installed, failed, restart }
 //   игра → { t: 'restart', join, mc }  лаунчер → { t: 'restart_ok' }
+//   игра → { t: 'ping' }  лаунчер → { t: 'pong' }
 // mc — версия игры друга, если она не та, что запущена: лаунчер перезапустит
 // игру уже на ней.
 // На любую неудачу лаунчер отвечает { t: 'error', text }.
+// ping — пропуск для модов Mist MC: без ответа лаунчера они не включаются.
+// Моды до 1.8.21 принимают и ответ на неизвестную просьбу.
 
 const net = require('net');
 const crypto = require('crypto');
@@ -25,17 +28,26 @@ const MOD_ID_RE = /^[a-z][a-z0-9_-]{1,63}$/;
 const SHA1_RE = /^[0-9a-f]{40}$/;
 const MAX_MODS = 200;
 
+// ключи прошлых игр годятся только для ping: вторая игра не должна отбирать
+// пропуск у первой, которая ещё грузится; ставить моды и перезапускать игру
+// может лишь последняя
+const KEEP_TOKENS = 4;
+
 let server = null;
 let port = 0;
-let token = null;
+let tokens = [];
 let handlers = null;
 let busy = false;
 
-function sameToken(given) {
-  if (!token || typeof given !== 'string') return false;
+/** 'current' — ключ последней игры, 'old' — одной из прошлых, иначе null. */
+function tokenKind(given) {
+  if (typeof given !== 'string') return null;
   const a = Buffer.from(given);
-  const b = Buffer.from(token);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const i = tokens.findIndex((t) => {
+    const b = Buffer.from(t);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
+  return i < 0 ? null : i === 0 ? 'current' : 'old';
 }
 
 const clip = (s, n) => String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, n);
@@ -61,8 +73,12 @@ function cleanMods(raw) {
   return out;
 }
 
-async function onMessage(msg, reply) {
-  if (msg.t === 'sync') {
+async function onMessage(msg, reply, kind) {
+  if (msg.t === 'ping') {
+    reply({ t: 'pong' });
+  } else if (kind !== 'current') {
+    throw new Error('Игра запущена заново — эта просьба уже не действует.');
+  } else if (msg.t === 'sync') {
     if (busy) throw new Error('Моды уже ставятся — подождите.');
     const wanted = cleanMods(msg.mods);
     if (!wanted.length) throw new Error('Список модов пуст.');
@@ -84,7 +100,7 @@ async function onMessage(msg, reply) {
 
 function onConnection(sock) {
   let buf = '';
-  let authed = false;
+  let authed = null;
   let chain = Promise.resolve();
   sock.setEncoding('utf8');
   sock.setNoDelay(true);
@@ -96,12 +112,13 @@ function onConnection(sock) {
     if (!msg || typeof msg !== 'object') { sock.destroy(); return; }
     if (!authed) {
       // первым идёт ключ, выданный этой игре при запуске; чужим процессам ответа нет
-      if (msg.t !== 'hello' || !sameToken(msg.token)) { sock.destroy(); return; }
-      authed = true;
+      if (msg.t !== 'hello' || !tokenKind(msg.token)) { sock.destroy(); return; }
+      authed = msg.token;
       return;
     }
     try {
-      await onMessage(msg, reply);
+      // ключ мог устареть, пока соединение открыто: сверяем на каждой просьбе
+      await onMessage(msg, reply, tokenKind(authed));
     } catch (e) {
       reply({ t: 'error', text: e && e.message ? e.message : 'Не получилось.' });
     }
@@ -143,8 +160,8 @@ async function issue(h) {
       return null;
     }
   }
-  // ключ прошлой игры больше не действует
-  token = crypto.randomBytes(24).toString('hex');
+  const token = crypto.randomBytes(24).toString('hex');
+  tokens = [token, ...tokens].slice(0, KEEP_TOKENS);
   return port + ':' + token;
 }
 
