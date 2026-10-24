@@ -224,9 +224,14 @@ function makeDownloadOptions() {
 // реверс-прокси зеркала (JVM-флаги authlib, ответы 1:1 от Mojang).
 // profiles.host обязателен: EnvironmentParser authlib 7 читает все три.
 const MOJANG_SESSION_PROBE = 'https://api.minecraftservices.com/publickeys';
-const MOJANG_PROXY = buildSecret.NET.mojangProxy;
+// зеркала по порядку: KZ, затем РФ (у части провайдеров срезан как раз KZ)
+const AUTH_MIRRORS = buildSecret.NET.authMirrors || [];
+const MOJANG_PROXIES = AUTH_MIRRORS.map((m) => m + '/mojang');
+msauth.setProxies(AUTH_MIRRORS);
+// токен игры обновляем заранее, чтобы он не истёк посреди игры
+const MC_TOKEN_REFRESH_BEFORE_MS = 60 * 60 * 1000;
 async function mojangSessionJvmArgs() {
-  if (!MOJANG_PROXY) return [];
+  if (!MOJANG_PROXIES.length) return [];
   try {
     const res = await fetch(MOJANG_SESSION_PROBE, { signal: AbortSignal.timeout(6000) });
     if (res.ok) return [];
@@ -234,18 +239,26 @@ async function mojangSessionJvmArgs() {
   } catch (e) {
     logLine('ⓘ Сервисы Mojang недоступны (' + describeError(e).split('\n')[0] + ') — скины пойдут через зеркало');
   }
-  try {
-    // прокси тоже может быть недоступен — тогда штатные хосты (хуже не станет)
-    const res = await fetch(MOJANG_PROXY + '/services/publickeys', { signal: AbortSignal.timeout(6000) });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-  } catch (e) {
-    logLine('ⓘ Зеркало Mojang-сервисов тоже недоступно (' + describeError(e).split('\n')[0] + ') — запускаю со штатными хостами');
+  // прокси тоже может быть недоступен — тогда штатные хосты (хуже не станет)
+  let proxy = '';
+  for (const p of MOJANG_PROXIES) {
+    try {
+      const res = await fetch(p + '/services/publickeys', { signal: AbortSignal.timeout(6000) });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      proxy = p;
+      break;
+    } catch (e) {
+      logLine('ⓘ Зеркало ' + new URL(p).host + ' недоступно (' + describeError(e).split('\n')[0] + ')');
+    }
+  }
+  if (!proxy) {
+    logLine('ⓘ Зеркала Mojang-сервисов недоступны — запускаю со штатными хостами');
     return [];
   }
   return [
-    '-Dminecraft.api.session.host=' + MOJANG_PROXY + '/session',
-    '-Dminecraft.api.services.host=' + MOJANG_PROXY + '/services',
-    '-Dminecraft.api.profiles.host=' + MOJANG_PROXY + '/profiles',
+    '-Dminecraft.api.session.host=' + proxy + '/session',
+    '-Dminecraft.api.services.host=' + proxy + '/services',
+    '-Dminecraft.api.profiles.host=' + proxy + '/profiles',
   ];
 }
 
@@ -615,6 +628,11 @@ function readAccounts(cfg) {
     if (a.type === 'msa' && a.uuid) {
       acc = { type: 'msa', name: a.name, uuid: a.uuid,
         refreshToken: a.refreshToken || decryptSecret(a.refreshTokenEnc) || null };
+      const mcToken = a.mcToken || decryptSecret(a.mcTokenEnc);
+      if (mcToken && Number(a.mcTokenExp) > Date.now()) {
+        acc.mcToken = mcToken;
+        acc.mcTokenExp = Number(a.mcTokenExp);
+      }
     } else if (a.type === 'offline' && NICK_RE.test(a.name)) {
       acc = { type: 'offline', name: a.name };
     }
@@ -644,9 +662,13 @@ function saveConfig(cfg) {
       toWrite.accounts = cfg.accounts.map((a) => {
         if (a.type !== 'msa') return { type: 'offline', name: a.name };
         const enc = encryptSecret(a.refreshToken);
-        return enc
+        const out = enc
           ? { type: 'msa', name: a.name, uuid: a.uuid, refreshTokenEnc: enc }
           : { type: 'msa', name: a.name, uuid: a.uuid, refreshToken: a.refreshToken || null };
+        // токен игры кэшируем только зашифрованным: без хранилища ОС его не пишем
+        const mcEnc = a.mcToken && a.mcTokenExp > Date.now() ? encryptSecret(a.mcToken) : null;
+        if (mcEnc) Object.assign(out, { mcTokenEnc: mcEnc, mcTokenExp: a.mcTokenExp });
+        return out;
       });
     }
     fs.writeFileSync(configPath(), JSON.stringify(toWrite, null, 2));
@@ -1806,7 +1828,8 @@ ipcMain.handle('ms-login', async () => {
   try {
     if (!MS_CLIENT_ID) throw new Error('в этой сборке вход Microsoft не настроен (нет client_id)');
     const acc = await msauth.login(MS_CLIENT_ID, mainWindow);
-    return signIn({ type: 'msa', name: acc.name, uuid: acc.uuid, refreshToken: acc.refreshToken });
+    return signIn({ type: 'msa', name: acc.name, uuid: acc.uuid, refreshToken: acc.refreshToken,
+      mcToken: acc.accessToken, mcTokenExp: acc.accessTokenExp });
   } catch (err) {
     return { ok: false, error: authErrorText(err) };
   }
@@ -2461,28 +2484,51 @@ async function launchGame(opts) {
     if (process.arch === 'ia32' && (parseInt(opts.ram, 10) || 4096) > ram) {
       logLine('ⓘ 32-битная система: память игры ограничена ' + ram + ' МБ.');
     }
-    // msa: обновляем токен Microsoft → свежий Minecraft-токен.
+    // msa: токен игры живёт ~сутки — пока он не на исходе, Microsoft не трогаем;
+    // иначе обновляем по refresh-токену. Сетевой сбой (провайдер режет
+    // Microsoft/Xbox) — не повод выкидывать из аккаунта: играем на кэше, а без
+    // него просим повторить, аккаунт не сбрасывая.
     // offline: играем по нику, токен не нужен (FastLogin на сервере разрулит).
     let account;
     if (active.type === 'msa') {
-      status('Проверка входа Microsoft…');
-      try {
-        if (!active.refreshToken) throw new Error('сохранённый вход не читается');
-        const fresh = await msauth.refresh(MS_CLIENT_ID, active.refreshToken);
-        const cfg = loadConfig();
-        const saved = { refreshToken: fresh.refreshToken, name: fresh.name, uuid: fresh.uuid };
-        const i = cfg.accounts.findIndex((a) => accountKey(a) === activeKey);
-        if (i >= 0) cfg.accounts[i] = { type: 'msa', ...saved };
-        if (cfg.msAccount && cfg.msAccount.uuid === fresh.uuid) cfg.msAccount = saved;
-        saveConfig(cfg);
-        account = { name: fresh.name, uuid: fresh.uuid, accessToken: fresh.accessToken, userType: 'msa' };
-      } catch (e) {
-        launching = false;
-        send('state', { state: 'idle' });
-        const t = authErrorText(e);
-        logLine('✖ ' + t);
-        send('auth-expired');
-        return { ok: false, error: 'Вход Microsoft истёк, войдите заново: ' + t };
+      const cachedLeft = active.mcToken ? active.mcTokenExp - Date.now() : 0;
+      const fromCache = () => ({ name: active.name, uuid: active.uuid, accessToken: active.mcToken, userType: 'msa' });
+      if (cachedLeft > MC_TOKEN_REFRESH_BEFORE_MS) {
+        account = fromCache();
+      } else {
+        status('Проверка входа Microsoft…');
+        try {
+          if (!active.refreshToken) throw new Error('сохранённый вход не читается');
+          const fresh = await msauth.refresh(MS_CLIENT_ID, active.refreshToken);
+          const cfg = loadConfig();
+          const saved = { refreshToken: fresh.refreshToken, name: fresh.name, uuid: fresh.uuid };
+          const i = cfg.accounts.findIndex((a) => accountKey(a) === activeKey);
+          if (i >= 0) {
+            cfg.accounts[i] = { type: 'msa', ...saved, mcToken: fresh.accessToken, mcTokenExp: fresh.accessTokenExp };
+          }
+          if (cfg.msAccount && cfg.msAccount.uuid === fresh.uuid) cfg.msAccount = saved;
+          saveConfig(cfg);
+          account = { name: fresh.name, uuid: fresh.uuid, accessToken: fresh.accessToken, userType: 'msa' };
+        } catch (e) {
+          const t = authErrorText(e);
+          if (e.transient && cachedLeft > 0) {
+            logLine('ⓘ Microsoft недоступен (' + t + ') — играю с сохранённым входом, он действует ещё '
+              + Math.ceil(cachedLeft / 60000) + ' мин');
+            account = fromCache();
+          } else if (e.transient) {
+            launching = false;
+            send('state', { state: 'idle' });
+            logLine('✖ ' + t);
+            return { ok: false, error: 'Не удалось связаться с Microsoft — вход сохранён, выходить не нужно. '
+              + 'Попробуйте ещё раз через минуту или включите VPN на время запуска. (' + t + ')' };
+          } else {
+            launching = false;
+            send('state', { state: 'idle' });
+            logLine('✖ ' + t);
+            send('auth-expired');
+            return { ok: false, error: 'Вход Microsoft истёк, войдите заново: ' + t };
+          }
+        }
       }
     } else {
       account = { name: active.name, uuid: offlineUuid(active.name), accessToken: '0', userType: 'mojang' };

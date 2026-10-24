@@ -12,7 +12,7 @@ module.exports = {
     joinHost: '',
     mirrorSite: '',
     mirrorDownloads: '',
-    mojangProxy: '',
+    authMirrors: [],
     packUrls: [],
     modrinthProxy: '',
     modrinthApi: '',

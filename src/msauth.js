@@ -129,24 +129,98 @@ function getAuthCode(clientId, parent) {
   });
 }
 
+// Запасные маршруты: у части провайдеров срезаны Microsoft/Xbox целиком, и
+// тихое обновление входа падало «fetch failed» при каждом запуске. Сами
+// запросы (обмен токенов, Xbox, XSTS, Minecraft Services) идут через
+// реверс-прокси наших зеркал; страницу входа так не пустить — первый вход
+// по-прежнему напрямую.
+const PROXY_PATHS = {
+  [`${AUTHORITY}/token`]: '/msauth/token',
+  'https://user.auth.xboxlive.com/user/authenticate': '/msauth/xbl',
+  'https://xsts.auth.xboxlive.com/xsts/authorize': '/msauth/xsts',
+  'https://api.minecraftservices.com/authentication/login_with_xbox': '/mojang/services/authentication/login_with_xbox',
+  'https://api.minecraftservices.com/minecraft/profile': '/mojang/services/minecraft/profile',
+};
+const ROUTE_TIMEOUT_MS = 12000;
+let proxies = [];
+// маршрут, ответивший последним: следующие запросы идут сразу через него,
+// не дожидаясь таймаута напрямую
+let preferred = '';
+
+function setProxies(list) {
+  proxies = (list || []).filter((p) => /^https:\/\//.test(p)).map((p) => p.replace(/\/+$/, ''));
+}
+
+// Сеть не дала ответа ни одним маршрутом (или сервис временно лёг): вход при
+// этом не истёк, сбрасывать аккаунт нельзя.
+function transientError(message) {
+  const e = new Error(message);
+  e.transient = true;
+  return e;
+}
+
+async function routedFetch(url, init) {
+  const proxyPath = PROXY_PATHS[url];
+  const routes = [''].concat(proxyPath ? proxies : []);
+  if (preferred && routes.includes(preferred)) {
+    routes.splice(routes.indexOf(preferred), 1);
+    routes.unshift(preferred);
+  }
+  let lastErr = null;
+  for (const base of routes) {
+    try {
+      const res = await fetch(base ? base + proxyPath : url,
+        Object.assign({}, init, { signal: AbortSignal.timeout(ROUTE_TIMEOUT_MS) }));
+      // 502/504 от прокси = до Microsoft не достучался он сам, пробуем дальше;
+      // HTML-404 = на этом зеркале прокси нет (Microsoft и Mojang отвечают JSON)
+      const proxyMiss = res.status === 404 && /html/i.test(res.headers.get('content-type') || '');
+      if (base && (res.status === 502 || res.status === 504 || proxyMiss)) {
+        lastErr = new Error('HTTP ' + res.status);
+        continue;
+      }
+      preferred = base;
+      return res;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  const host = new URL(url).host;
+  throw transientError('нет связи с ' + host + (proxyPath && proxies.length ? ' (и через зеркала)' : '')
+    + ': ' + (lastErr && lastErr.message ? lastErr.message : lastErr));
+}
+
+// Ответы, при которых повторный вход не поможет и не нужен: перегрузка или
+// сбой на стороне Microsoft/Mojang.
+function isTransientStatus(status) {
+  return status === 429 || status >= 500;
+}
+
 async function postForm(url, form) {
-  const res = await fetch(url, {
+  const res = await routedFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(form).toString(),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error('token ' + res.status + ': ' + text.slice(0, 200));
+  if (!res.ok) {
+    const msg = 'token ' + res.status + ': ' + text.slice(0, 200);
+    throw isTransientStatus(res.status) ? transientError(msg) : new Error(msg);
+  }
   return JSON.parse(text);
 }
 
 async function postJson(url, body, headers) {
-  const res = await fetch(url, {
+  const res = await routedFetch(url, {
     method: 'POST',
     headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, headers || {}),
     body: JSON.stringify(body),
   });
   return res;
+}
+
+function failStatus(what, res) {
+  const msg = what + ': ' + res.status;
+  return isTransientStatus(res.status) ? transientError(msg) : new Error(msg);
 }
 
 function xstsErrorMessage(xerr) {
@@ -169,7 +243,7 @@ async function toMinecraft(msTokens) {
     RelyingParty: 'http://auth.xboxlive.com',
     TokenType: 'JWT',
   });
-  if (!xblRes.ok) throw new Error('Xbox Live: ' + xblRes.status);
+  if (!xblRes.ok) throw failStatus('Xbox Live', xblRes);
   const xbl = await xblRes.json();
   const xblToken = xbl.Token;
   const uhs = xbl.DisplayClaims.xui[0].uhs;
@@ -183,7 +257,7 @@ async function toMinecraft(msTokens) {
     const j = await xstsRes.json().catch(() => ({}));
     throw new Error(xstsErrorMessage(j.XErr));
   }
-  if (!xstsRes.ok) throw new Error('XSTS: ' + xstsRes.status);
+  if (!xstsRes.ok) throw failStatus('XSTS', xstsRes);
   const xsts = await xstsRes.json();
   const xstsToken = xsts.Token;
 
@@ -193,21 +267,23 @@ async function toMinecraft(msTokens) {
   if (mcRes.status === 403) {
     throw new Error('APP_NOT_APPROVED');
   }
-  if (!mcRes.ok) throw new Error('Minecraft auth: ' + mcRes.status);
+  if (!mcRes.ok) throw failStatus('Minecraft auth', mcRes);
   const mc = await mcRes.json();
   const mcAccess = mc.access_token;
 
-  const profRes = await fetch('https://api.minecraftservices.com/minecraft/profile', {
+  const profRes = await routedFetch('https://api.minecraftservices.com/minecraft/profile', {
     headers: { Authorization: 'Bearer ' + mcAccess },
   });
   if (profRes.status === 404) throw new Error('NO_MINECRAFT');
-  if (!profRes.ok) throw new Error('Профиль Minecraft: ' + profRes.status);
+  if (!profRes.ok) throw failStatus('Профиль Minecraft', profRes);
   const prof = await profRes.json();
 
+  const lifetime = Number(mc.expires_in) > 0 ? Number(mc.expires_in) : 86400;
   return {
     name: prof.name,
     uuid: prof.id,
     accessToken: mcAccess,
+    accessTokenExp: Date.now() + lifetime * 1000,
     refreshToken: msTokens.refresh_token,
   };
 }
@@ -258,4 +334,4 @@ async function refresh(clientId, refreshToken) {
   return toMinecraft(tokens);
 }
 
-module.exports = { login, refresh };
+module.exports = { login, refresh, setProxies };
